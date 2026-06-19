@@ -1,0 +1,29 @@
+# ── Build output ───────────────────────────────────────────────
+bin/
+obj/
+dist/
+# Stray compiled assemblies in the repo root (build artifacts)
+/*.dll
+
+# ── IDE / editor / agent ───────────────────────────────────────
+.vs/
+.vscode/
+.claude/
+CLAUDE.md
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# ── Runtime logs ───────────────────────────────────────────────
+*_log.txt
+KartogrammaPlugin_log.txt
+
+# ── OS ─────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+.DS_Store
+desktop.ini
+
+# ── Mac AppleDouble files (OneDrive) ───────────────────────────
+._*

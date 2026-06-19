@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0" ProductType="Application"
+    Name="KartogrammaPlugin"
+    AppVersion="1.1.1"
+    Description="Картограмма земляных работ для AutoCAD Civil 3D"
+    ProductCode="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
+    Author="KartogrammaPlugin"
+    AutodeskProduct="AutoCAD">
+
+  <CompanyDetails Name="KartogrammaPlugin" />
+
+  <RuntimeRequirements />
+
+  <!--
+    ═══════════════════════════════════════════════════════════════
+     Civil 3D 2015-2024: .NET Framework 4.8
+     AutoCAD Series: R20.0 (2015) – R24.3 (2024)
+     Требует .NET 4.8 runtime (предустановлен на Windows 10 1903+).
+    ═══════════════════════════════════════════════════════════════
+  -->
+  <Components Description="Civil 3D 2015-2024">
+    <RuntimeRequirements OS="Win64" Platform="Civil3D" SeriesMin="R20.0" SeriesMax="R24.3" />
+    <ComponentEntry AppName="KartogrammaPlugin" Version="1.1.1"
+        ModuleName="./Contents/net48/openkartogramma.dll"
+        AppDescription="Картограмма земляных работ"
+        LoadOnAutoCADStartup="true" />
+  </Components>
+
+  <!--
+    ═══════════════════════════════════════════════════════════════
+     Civil 3D 2025+: .NET 8
+     AutoCAD Series: R25.0 (2025), R25.1 (2026), …
+    ═══════════════════════════════════════════════════════════════
+  -->
+  <Components Description="Civil 3D 2025+">
+    <RuntimeRequirements OS="Win64" Platform="Civil3D" SeriesMin="R25.0" />
+    <ComponentEntry AppName="KartogrammaPlugin" Version="1.1.1"
+        ModuleName="./Contents/net8/openkartogramma.dll"
+        AppDescription="Картограмма земляных работ"
+        LoadOnAutoCADStartup="true" />
+  </Components>
+
+</ApplicationPackage>

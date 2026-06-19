@@ -1,0 +1,163 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ═══════════════════════════════════════════════════════════════
+     СОВМЕСТИМОСТЬ:
+       Civil 3D 2015-2024  →  .NET Framework 4.8  (net48)
+       Civil 3D 2025+      →  .NET 8              (net8.0-windows)
+
+     Сборка ОБА варианта.
+     Проект автоматически находит DLL из той версии AutoCAD,
+     которая установлена на данном ПК (2015–2026).
+
+     Civil 3D 2011-2014 НЕ поддерживается: другая структура API,
+     отсутствие accoremgd.dll (до 2013), .NET 3.5/4.0.
+    ═══════════════════════════════════════════════════════════════
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net48;net8.0-windows</TargetFrameworks>
+    <OutputType>Library</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>openkartogramma</AssemblyName>
+    <RootNamespace>KartogrammaPlugin</RootNamespace>
+    <Nullable>enable</Nullable>
+    <LangVersion>10</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- AutoCAD DLL не копируем в output — они уже есть в папке AutoCAD -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <!-- Исключаем тестовый проект из основной сборки -->
+  <ItemGroup>
+    <Compile Remove="KartogrammaTests\**" />
+    <None Remove="KartogrammaTests\**" />
+  </ItemGroup>
+
+  <!--
+    Пакет reference-сборок .NET Framework гарантирует компиляцию
+    net45/net48 даже без установленных targeting pack (Visual Studio).
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!--
+    ═══════════════════════════════════════════════════════════════
+     ПУТИ К DLL — автоопределение установленной версии AutoCAD
+     MSBuild выберет первый существующий путь.
+     Порядок приоритета: 2026 → 2025 → 2024 → … → 2015
+    ═══════════════════════════════════════════════════════════════
+  -->
+  <PropertyGroup>
+    <AcadPath2027>C:\Program Files\Autodesk\AutoCAD 2027</AcadPath2027>
+    <AcadPath2026>C:\Program Files\Autodesk\AutoCAD 2026</AcadPath2026>
+    <AcadPath2025>C:\Program Files\Autodesk\AutoCAD 2025</AcadPath2025>
+    <AcadPath2024>C:\Program Files\Autodesk\AutoCAD 2024</AcadPath2024>
+    <AcadPath2023>C:\Program Files\Autodesk\AutoCAD 2023</AcadPath2023>
+    <AcadPath2022>C:\Program Files\Autodesk\AutoCAD 2022</AcadPath2022>
+    <AcadPath2021>C:\Program Files\Autodesk\AutoCAD 2021</AcadPath2021>
+    <AcadPath2020>C:\Program Files\Autodesk\AutoCAD 2020</AcadPath2020>
+    <AcadPath2019>C:\Program Files\Autodesk\AutoCAD 2019</AcadPath2019>
+    <AcadPath2018>C:\Program Files\Autodesk\AutoCAD 2018</AcadPath2018>
+    <AcadPath2017>C:\Program Files\Autodesk\AutoCAD 2017</AcadPath2017>
+    <AcadPath2016>C:\Program Files\Autodesk\AutoCAD 2016</AcadPath2016>
+    <AcadPath2015>C:\Program Files\Autodesk\AutoCAD 2015</AcadPath2015>
+
+    <!-- Автоопределение: берём первую установленную версию -->
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2027)\acdbmgd.dll')">$(AcadPath2027)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2026)\acdbmgd.dll')">$(AcadPath2026)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2025)\acdbmgd.dll')">$(AcadPath2025)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2024)\acdbmgd.dll')">$(AcadPath2024)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2023)\acdbmgd.dll')">$(AcadPath2023)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2022)\acdbmgd.dll')">$(AcadPath2022)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2021)\acdbmgd.dll')">$(AcadPath2021)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2020)\acdbmgd.dll')">$(AcadPath2020)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2019)\acdbmgd.dll')">$(AcadPath2019)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2018)\acdbmgd.dll')">$(AcadPath2018)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2017)\acdbmgd.dll')">$(AcadPath2017)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2016)\acdbmgd.dll')">$(AcadPath2016)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2015)\acdbmgd.dll')">$(AcadPath2015)</AcadPathResolved>
+
+    <!-- Civil 3D DLL: в подпапке C3D (2021+) или в корне AutoCAD (2015-2020) -->
+    <C3DPathResolved Condition="Exists('$(AcadPathResolved)\C3D\AeccDbMgd.dll')">$(AcadPathResolved)\C3D</C3DPathResolved>
+    <C3DPathResolved Condition="'$(C3DPathResolved)' == '' AND Exists('$(AcadPathResolved)\AeccDbMgd.dll')">$(AcadPathResolved)</C3DPathResolved>
+
+    <!-- Куда автодеплой кладёт DLL (внутри бандла) -->
+    <BundleBase>$(APPDATA)\Autodesk\ApplicationPlugins\KartogrammaPlugin.bundle\Contents</BundleBase>
+  </PropertyGroup>
+
+  <!-- ── Единый набор зависимостей для всех TFM ────────────────────────── -->
+  <!--
+    Используем DLL из найденной версии AutoCAD.
+    Private=false: DLL не копируются — AutoCAD предоставит свои при загрузке.
+    API acdbmgd/acmgd/accoremgd/AecBaseMgd/AeccDbMgd стабилен между 2015-2026,
+    поэтому DLL, скомпилированная по любой версии, работает на всех остальных
+    благодаря assembly binding redirect, встроенному в AutoCAD.
+  -->
+  <ItemGroup Condition="'$(AcadPathResolved)' != ''">
+    <Reference Include="acdbmgd">
+      <HintPath>$(AcadPathResolved)\acdbmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(AcadPathResolved)\acmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="accoremgd">
+      <HintPath>$(AcadPathResolved)\accoremgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AecBaseMgd">
+      <HintPath>$(AcadPathResolved)\AecBaseMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Лента (Ribbon) AutoCAD -->
+    <Reference Include="AdWindows">
+      <HintPath>$(AcadPathResolved)\AdWindows.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(C3DPathResolved)' != ''">
+    <Reference Include="AeccDbMgd">
+      <HintPath>$(C3DPathResolved)\AeccDbMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!--
+    ═══════════════════════════════════════════════════════════════
+     АВТОДЕПЛОЙ В БАНДЛ после каждой сборки
+     DLL автоматически копируется в нужную папку бандла.
+     Civil 3D сам выбирает правильную DLL при запуске.
+    ═══════════════════════════════════════════════════════════════
+  -->
+  <Target Name="DeployToBundle" AfterTargets="Build"
+          Condition="'$(TargetFramework)' == 'net48' OR '$(TargetFramework)' == 'net8.0-windows'">
+
+    <!-- Определяем подпапку по целевому фреймворку -->
+    <PropertyGroup>
+      <_BundleSubDir Condition="'$(TargetFramework)' == 'net8.0-windows'">net8</_BundleSubDir>
+      <_BundleSubDir Condition="'$(TargetFramework)' == 'net48'">net48</_BundleSubDir>
+      <_BundleDest>$(BundleBase)\$(_BundleSubDir)</_BundleDest>
+    </PropertyGroup>
+
+    <MakeDir Directories="$(_BundleDest)" Condition="!Exists('$(_BundleDest)')" />
+
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="$(_BundleDest)"
+          SkipUnchangedFiles="false"
+          OverwriteReadOnlyFiles="true" />
+
+    <!-- PackageContents.xml → корень бандла (Civil 3D ищет его там) -->
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\bundle\PackageContents.xml"
+          DestinationFolder="$(BundleBase)\.."
+          SkipUnchangedFiles="true"
+          OverwriteReadOnlyFiles="true"
+          Condition="Exists('$(MSBuildProjectDirectory)\bundle\PackageContents.xml')" />
+
+    <Message Text="▶ Deployed $(TargetFramework) → $(_BundleDest)  [AutoCAD DLLs from: $(AcadPathResolved)]" Importance="High" />
+  </Target>
+
+</Project>

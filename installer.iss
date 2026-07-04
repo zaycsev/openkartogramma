@@ -1,16 +1,16 @@
 ; ============================================================
 ;  Inno Setup Script -- Kartogramma Plugin v{#AppVersion}
-;  Build:  .\build-installer.ps1 [-Version "1.1.1"]
+;  Build:  .\build-installer.ps1 [-Version "1.1.2"]
 ;  Output: dist\Setup_KartogrammaPlugin_v*.exe
 ; ============================================================
 
 #ifndef AppVersion
-  #define AppVersion "1.1.1"
+  #define AppVersion "1.1.2"
 #endif
 
 #define AppName      "Kartogramma zemlyanyh rabot"
 #define AppNameRu    "Картограмма земляных работ"
-#define AppPublisher "OPG Zaycsev"
+#define AppPublisher "Zaycsev"
 #define AppURL       "https://github.com/zaycsev/openkartogramma"
 #define BundleName   "KartogrammaPlugin.bundle"
 #define BundleSrc    "dist\bundle"

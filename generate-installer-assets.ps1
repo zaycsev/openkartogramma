@@ -4,7 +4,7 @@
 #                   dist\assets\wizard_small.png  (55x55)
 #                   dist\assets\setup.ico          (16/32/48 px)
 # ============================================================
-param([string]$Version = "1.1.1")
+param([string]$Version = "1.1.2")
 
 $ErrorActionPreference = "Stop"
 $outDir = "$PSScriptRoot\dist\assets"

@@ -83,6 +83,10 @@
     <C3DPathResolved Condition="Exists('$(AcadPathResolved)\C3D\AeccDbMgd.dll')">$(AcadPathResolved)\C3D</C3DPathResolved>
     <C3DPathResolved Condition="'$(C3DPathResolved)' == '' AND Exists('$(AcadPathResolved)\AeccDbMgd.dll')">$(AcadPathResolved)</C3DPathResolved>
 
+    <!-- AEC base DLL: в подпапке ACA (2026+) или в корне AutoCAD (более ранние) -->
+    <AecBasePathResolved Condition="Exists('$(AcadPathResolved)\ACA\AecBaseMgd.dll')">$(AcadPathResolved)\ACA</AecBasePathResolved>
+    <AecBasePathResolved Condition="'$(AecBasePathResolved)' == '' AND Exists('$(AcadPathResolved)\AecBaseMgd.dll')">$(AcadPathResolved)</AecBasePathResolved>
+
     <!-- Куда автодеплой кладёт DLL (внутри бандла) -->
     <BundleBase>$(APPDATA)\Autodesk\ApplicationPlugins\KartogrammaPlugin.bundle\Contents</BundleBase>
   </PropertyGroup>
@@ -108,10 +112,6 @@
       <HintPath>$(AcadPathResolved)\accoremgd.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="AecBaseMgd">
-      <HintPath>$(AcadPathResolved)\AecBaseMgd.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
     <!-- Лента (Ribbon) AutoCAD -->
     <Reference Include="AdWindows">
       <HintPath>$(AcadPathResolved)\AdWindows.dll</HintPath>
@@ -122,6 +122,13 @@
   <ItemGroup Condition="'$(C3DPathResolved)' != ''">
     <Reference Include="AeccDbMgd">
       <HintPath>$(C3DPathResolved)\AeccDbMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(AecBasePathResolved)' != ''">
+    <Reference Include="AecBaseMgd">
+      <HintPath>$(AecBasePathResolved)\AecBaseMgd.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

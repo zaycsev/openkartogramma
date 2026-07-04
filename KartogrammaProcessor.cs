@@ -72,6 +72,9 @@ namespace KartogrammaPlugin
                     return;
                 }
 
+                // Границы грузим ДО CalcAutoGrid — они задают габариты сетки.
+                LoadManualBoundaries(trans);
+
                 if (_o.AutoBasePoint) CalcAutoBasePoint(surf1!, surf2!);
 
                 var tst = (TextStyleTable)trans.GetObject(_db.TextStyleTableId, OpenMode.ForRead);
@@ -120,6 +123,9 @@ namespace KartogrammaPlugin
                     return;
                 }
 
+                // Границы грузим ДО CalcAutoGrid — они задают габариты сетки.
+                LoadManualBoundaries(trans);
+
                 if (_o.AutoBasePoint) CalcAutoBasePoint(surf1!, surf2!);
 
                 var tst = (TextStyleTable)trans.GetObject(_db.TextStyleTableId, OpenMode.ForRead);
@@ -153,26 +159,8 @@ namespace KartogrammaPlugin
                 EraseByLayer(trans, _ms, _o.VolumeLayerName);
                 EraseByLayer(trans, _ms, _o.TableLayerName);
 
-                // Загрузить наружную границу (если задана)
-                _boundaryPts = null;
-                _innerPtsList = null;
-                if (!_o.AutoBounds && !_o.OuterBoundaryId.IsNull)
-                {
-                    var bndPl = trans.GetObject(_o.OuterBoundaryId, OpenMode.ForRead) as Polyline;
-                    if (bndPl != null && bndPl.Closed)
-                        _boundaryPts = GetPolylinePoints(bndPl);
-                }
-                if (!_o.AutoBounds && _o.InnerBoundaryIds != null && _o.InnerBoundaryIds.Count > 0)
-                {
-                    _innerPtsList = new List<List<Point2d>>();
-                    foreach (var innerId in _o.InnerBoundaryIds)
-                    {
-                        if (innerId.IsNull) continue;
-                        var ipl = trans.GetObject(innerId, OpenMode.ForRead) as Polyline;
-                        if (ipl != null && ipl.Closed)
-                            _innerPtsList.Add(GetPolylinePoints(ipl));
-                    }
-                }
+                // Наружная граница и внутренние «дырки» уже загружены выше в
+                // LoadManualBoundaries (_boundaryPts / _innerPtsList) — до CalcAutoGrid.
 
                 // === Перестроение сетки (только в зоне перекрытия поверхностей) ===
                 Report("Построение сетки…", 2);
@@ -222,19 +210,32 @@ namespace KartogrammaPlugin
                     //   Triangulation — субтреугольная разбивка, точно.
                     //   Squares       — классический ручной метод S×(h1+h2+h3+h4)/4
                     //                   по отметкам в 4 углах ячейки.
-                    double vol = _o.VolumeMethod == VolumeMethod.Squares
-                        ? CalcCellVolumeSquares (r, c, surf1!, surf2!, cosA, sinA)
-                        : CalcCellVolumeAccurate(r, c, surf1!, surf2!, cosA, sinA);
+                    double vol, cellArea;
+                    if (_o.VolumeMethod == VolumeMethod.Squares)
+                    {
+                        vol      = CalcCellVolumeSquares(r, c, surf1!, surf2!, cosA, sinA);
+                        cellArea = CalcCellEffectiveArea (r, c, surf1!, surf2!, cosA, sinA);
+                    }
+                    else
+                    {
+                        // Площадь берём из ТОЙ ЖЕ субтреугольной интеграции, что и
+                        // объём — она согласована с объёмом и совпадает с площадью
+                        // из «пульта объёмов» Civil (композитная площадь перекрытия),
+                        // а не считается отдельной грубой выборкой 20×20.
+                        vol = CalcCellVolumeAccurate(r, c, surf1!, surf2!, cosA, sinA,
+                            out cellArea);
+                    }
                     cellsDone++;
 
                     if (cellsDone % 50 == 0 || cellsDone == totalCells)
                         Report($"Объём: {cellsDone}/{totalCells} ячеек…",
                             10 + (int)(80.0 * cellsDone / totalCells));
 
-                    if (vol == 0.0) continue;          // ячейка полностью вне зоны
+                    // Площадь перекрытия суммируем независимо от порога объёма
+                    // (как в Civil — площадь не зависит от отсечения малых объёмов).
+                    totalArea += cellArea;
 
-                    // Эффективная площадь ячейки (только для ячеек в зоне перекрытия)
-                    totalArea += CalcCellEffectiveArea(r, c, surf1!, surf2!, cosA, sinA);
+                    if (vol == 0.0) continue;          // ячейка полностью вне зоны
 
                     double absVol = Math.Abs(vol);
                     if (absVol < _o.MinVolume) continue;
@@ -714,6 +715,38 @@ namespace KartogrammaPlugin
         }
 
         // ═══════════════════════════════════════════════════════════════════════
+        //  Загрузить ручные границы (внешнюю и внутренние) в поля _boundaryPts /
+        //  _innerPtsList. Вызывается ДО CalcAutoGrid, чтобы габариты и базовая
+        //  точка сетки могли строиться по внешней границе, а не только по
+        //  поверхностям. В авто-режиме поля остаются null.
+        // ═══════════════════════════════════════════════════════════════════════
+        private void LoadManualBoundaries(Transaction trans)
+        {
+            _boundaryPts  = null;
+            _innerPtsList = null;
+            if (_o.AutoBounds) return;
+
+            if (!_o.OuterBoundaryId.IsNull)
+            {
+                var bndPl = trans.GetObject(_o.OuterBoundaryId, OpenMode.ForRead) as Polyline;
+                if (bndPl != null && bndPl.Closed)
+                    _boundaryPts = GetPolylinePoints(bndPl);
+            }
+
+            if (_o.InnerBoundaryIds != null && _o.InnerBoundaryIds.Count > 0)
+            {
+                _innerPtsList = new List<List<Point2d>>();
+                foreach (var innerId in _o.InnerBoundaryIds)
+                {
+                    if (innerId.IsNull) continue;
+                    var ipl = trans.GetObject(innerId, OpenMode.ForRead) as Polyline;
+                    if (ipl != null && ipl.Closed)
+                        _innerPtsList.Add(GetPolylinePoints(ipl));
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
         //  Автобазовая точка — предварительная установка (будет перезаписана CalcAutoGrid)
         // ═══════════════════════════════════════════════════════════════════════
         private void CalcAutoBasePoint(CivilSurface s1, CivilSurface s2)
@@ -737,6 +770,43 @@ namespace KartogrammaPlugin
             double ToLX(double wx, double wy) => wx * cosA + wy * sinA;
             double ToLY(double wx, double wy) => -wx * sinA + wy * cosA;
 
+            // ── Приоритет: ручная внешняя граница ────────────────────────────────
+            // Если пользователь очертил внешнюю границу, сетка ОБЯЗАНА покрывать
+            // именно её. Автопоиск зоны перекрытия поверхностей для повёрнутой
+            // узкой траншеи может «уехать» в сторону (берётся меньшая по
+            // axis-aligned-габаритам поверхность, а у повёрнутого прямоугольника
+            // AABB большой) — поэтому при наличии границы габариты и базовую точку
+            // считаем прямо по её вершинам в локальных координатах.
+            if (_boundaryPts != null && _boundaryPts.Count >= 3)
+            {
+                double gMinLX = double.MaxValue, gMinLY = double.MaxValue;
+                double gMaxLX = double.MinValue, gMaxLY = double.MinValue;
+                foreach (var p in _boundaryPts)
+                {
+                    double lx = ToLX(p.X, p.Y), ly = ToLY(p.X, p.Y);
+                    if (lx < gMinLX) gMinLX = lx; if (lx > gMaxLX) gMaxLX = lx;
+                    if (ly < gMinLY) gMinLY = ly; if (ly > gMaxLY) gMaxLY = ly;
+                }
+
+                double gW = gMaxLX - gMinLX, gH = gMaxLY - gMinLY;
+                cols = Clamp((int)Math.Ceiling(gW / sx), 1, 500);
+                rows = Clamp((int)Math.Ceiling(gH / sy), 1, 500);
+
+                if (_o.AutoBasePoint)
+                {
+                    // Центрируем: излишек (сетка чуть больше границы) поровну с двух сторон
+                    double excessX = cols * sx - gW;
+                    double excessY = rows * sy - gH;
+                    SetBaseFromLocal(gMinLX - excessX / 2.0, gMinLY - excessY / 2.0, cosA, sinA);
+                }
+
+                ed.WriteMessage(
+                    $"\n[Картограмма] Габариты по внешней границе: {gW:F3}×{gH:F3} м → {cols}×{rows} ячеек");
+                if (_o.AutoBasePoint)
+                    ed.WriteMessage($"\n[Картограмма] Базовая точка (по границе): X={_o.BaseX:F3}, Y={_o.BaseY:F3}");
+                return;
+            }
+
             var e1 = s1.GeometricExtents;
             var e2 = s2.GeometricExtents;
 
@@ -744,9 +814,8 @@ namespace KartogrammaPlugin
             double w2 = e2.MaxPoint.X - e2.MinPoint.X, h2 = e2.MaxPoint.Y - e2.MinPoint.Y;
             double area1 = w1 * h1, area2 = w2 * h2;
 
+            // Меньшая поверхность нужна только для фолбэка «нет перекрытия» ниже.
             CivilSurface smaller = area1 <= area2 ? s1 : s2;
-            CivilSurface larger  = area1 <= area2 ? s2 : s1;
-            var eLarger          = area1 <= area2 ? e2 : e1;
 
             ed.WriteMessage($"\n[Картограмма] {s1.Name}: {w1:F3}×{h1:F3} м");
             ed.WriteMessage($"\n[Картограмма] {s2.Name}: {w2:F3}×{h2:F3} м");
@@ -769,71 +838,50 @@ namespace KartogrammaPlugin
                 UpdateBounds(ext.MaxPoint.X, ext.MaxPoint.Y);
             }
 
-            var eSmall = smaller.GeometricExtents;
-
-            // ── Шаг 1: ВСЕ вершины TIN меньшей поверхности в локальных координатах
-            if (smaller is TinSurface tinSmall && tinSmall.Vertices.Count > 0)
+            // ── Габариты зоны ПЕРЕКРЫТИЯ поверхностей ────────────────────────────
+            // Берём вершины КАЖДОЙ TIN-поверхности, которые попадают на другую
+            // поверхность (там, где заданы обе отметки), и по ним строим габариты.
+            // Зона зависит строго от фактического перекрытия и НЕ зависит от того,
+            // какая поверхность «меньше» по axis-aligned габаритам. Это ключевое
+            // для повёрнутой узкой траншеи: её AABB большой, и прежняя эвристика
+            // «по меньшей поверхности» уводила сетку в сторону от перекрытия.
+            if (s1 is TinSurface tin1 && tin1.Vertices.Count > 0)
             {
-                ed.WriteMessage($"\n[Картограмма] Анализирую {tinSmall.Vertices.Count} вершин TIN...");
-                foreach (TinSurfaceVertex v in tinSmall.Vertices)
-                    UpdateBounds(v.Location.X, v.Location.Y);
-
-                // Расширяем до GeometricExtents если граница близко (< 2 ячейки)
-                double savedMinLX = minLX, savedMaxLX = maxLX;
-                double savedMinLY = minLY, savedMaxLY = maxLY;
-                double tmpMinLX = double.MaxValue, tmpMinLY = double.MaxValue;
-                double tmpMaxLX = double.MinValue, tmpMaxLY = double.MinValue;
-                void TmpBounds(double wx, double wy) {
-                    double lx = ToLX(wx, wy), ly = ToLY(wx, wy);
-                    if (lx < tmpMinLX) tmpMinLX = lx; if (lx > tmpMaxLX) tmpMaxLX = lx;
-                    if (ly < tmpMinLY) tmpMinLY = ly; if (ly > tmpMaxLY) tmpMaxLY = ly;
-                }
-                TmpBounds(eSmall.MinPoint.X, eSmall.MinPoint.Y);
-                TmpBounds(eSmall.MaxPoint.X, eSmall.MinPoint.Y);
-                TmpBounds(eSmall.MinPoint.X, eSmall.MaxPoint.Y);
-                TmpBounds(eSmall.MaxPoint.X, eSmall.MaxPoint.Y);
-
-                if (tmpMinLX >= savedMinLX - 2*sx) minLX = Math.Min(minLX, tmpMinLX);
-                if (tmpMinLY >= savedMinLY - 2*sy) minLY = Math.Min(minLY, tmpMinLY);
-                if (tmpMaxLX <= savedMaxLX + 2*sx) maxLX = Math.Max(maxLX, tmpMaxLX);
-                if (tmpMaxLY <= savedMaxLY + 2*sy) maxLY = Math.Max(maxLY, tmpMaxLY);
-
-                // Обрезаем по локальному bounding box большой поверхности
-                double clipMinLX = double.MaxValue, clipMinLY = double.MaxValue;
-                double clipMaxLX = double.MinValue, clipMaxLY = double.MinValue;
-                void ClipBounds(double wx, double wy) {
-                    double lx = ToLX(wx, wy), ly = ToLY(wx, wy);
-                    if (lx < clipMinLX) clipMinLX = lx; if (lx > clipMaxLX) clipMaxLX = lx;
-                    if (ly < clipMinLY) clipMinLY = ly; if (ly > clipMaxLY) clipMaxLY = ly;
-                }
-                ClipBounds(eLarger.MinPoint.X, eLarger.MinPoint.Y);
-                ClipBounds(eLarger.MaxPoint.X, eLarger.MinPoint.Y);
-                ClipBounds(eLarger.MinPoint.X, eLarger.MaxPoint.Y);
-                ClipBounds(eLarger.MaxPoint.X, eLarger.MaxPoint.Y);
-
-                minLX = Math.Max(minLX, clipMinLX);
-                minLY = Math.Max(minLY, clipMinLY);
-                maxLX = Math.Min(maxLX, clipMaxLX);
-                maxLY = Math.Min(maxLY, clipMaxLY);
-            }
-            // ── Шаг 2: меньшая не TinSurface — вершины большей
-            else if (larger is TinSurface tinLarge)
-            {
-                ed.WriteMessage($"\n[Картограмма] Анализирую {tinLarge.Vertices.Count} вершин второй TIN...");
-                foreach (TinSurfaceVertex v in tinLarge.Vertices)
-                    if (GetElev(smaller, v.Location.X, v.Location.Y).HasValue)
+                ed.WriteMessage($"\n[Картограмма] Анализирую {tin1.Vertices.Count} вершин '{s1.Name}'...");
+                foreach (TinSurfaceVertex v in tin1.Vertices)
+                    if (GetElev(s2, v.Location.X, v.Location.Y).HasValue)
                         UpdateBounds(v.Location.X, v.Location.Y);
             }
-            // ── Шаг 3: fallback — пересечение bounding boxes
-            else
+            if (s2 is TinSurface tin2 && tin2.Vertices.Count > 0)
             {
-                ed.WriteMessage($"\n[Картограмма] Fallback: пересечение bounding boxes...");
+                ed.WriteMessage($"\n[Картограмма] Анализирую {tin2.Vertices.Count} вершин '{s2.Name}'...");
+                foreach (TinSurfaceVertex v in tin2.Vertices)
+                    if (GetElev(s1, v.Location.X, v.Location.Y).HasValue)
+                        UpdateBounds(v.Location.X, v.Location.Y);
+            }
+
+            // Фолбэк: вершины не дали зоны (нет TIN, либо узкая полоса перекрытия
+            // прошла между редкими вершинами) — плотно сэмплируем пересечение
+            // axis-aligned габаритов поверхностей.
+            if (minLX >= maxLX || minLY >= maxLY)
+            {
                 double mnX = Math.Max(e1.MinPoint.X, e2.MinPoint.X);
                 double mnY = Math.Max(e1.MinPoint.Y, e2.MinPoint.Y);
                 double mxX = Math.Min(e1.MaxPoint.X, e2.MaxPoint.X);
                 double mxY = Math.Min(e1.MaxPoint.Y, e2.MaxPoint.Y);
-                UpdateBounds(mnX, mnY); UpdateBounds(mxX, mnY);
-                UpdateBounds(mnX, mxY); UpdateBounds(mxX, mxY);
+                if (mnX < mxX && mnY < mxY)
+                {
+                    ed.WriteMessage("\n[Картограмма] Вершины не дали зоны — сэмплирую пересечение габаритов...");
+                    const int NS = 160;
+                    double stX = (mxX - mnX) / NS, stY = (mxY - mnY) / NS;
+                    for (int i = 0; i <= NS; i++)
+                    for (int j = 0; j <= NS; j++)
+                    {
+                        double wx = mnX + j * stX, wy = mnY + i * stY;
+                        if (GetElev(s1, wx, wy).HasValue && GetElev(s2, wx, wy).HasValue)
+                            UpdateBounds(wx, wy);
+                    }
+                }
             }
 
             if (minLX >= maxLX || minLY >= maxLY)
@@ -848,13 +896,15 @@ namespace KartogrammaPlugin
                 return;
             }
 
-            // Добавляем полуячейку отступа с каждой стороны — равномерное перекрытие поверхностей
-            minLX -= sx * 0.5;  maxLX += sx * 0.5;
-            minLY -= sy * 0.5;  maxLY += sy * 0.5;
-
+            // Габариты берём РОВНО по зоне перекрытия — вершины поверхностей уже
+            // очерчивают фактические данные. Прежний «отступ в полклетки с каждой
+            // стороны» раздувал сетку на целую лишнюю ячейку и сдвигал её на
+            // полклетки, из-за чего повёрнутая узкая траншея заполнялась хуже
+            // (например 6 из 20 ячеек вместо 10 из 12). Теперь авто-габариты
+            // совпадают с ручной внешней границей той же зоны.
             double realW = maxLX - minLX;
             double realH = maxLY - minLY;
-            ed.WriteMessage($"\n[Картограмма] Зона (локальная, с отступами): {realW:F3}×{realH:F3} м");
+            ed.WriteMessage($"\n[Картограмма] Зона (локальная): {realW:F3}×{realH:F3} м");
 
             cols = Clamp((int)Math.Ceiling(realW / sx), 1, 500);
             rows = Clamp((int)Math.Ceiling(realH / sy), 1, 500);
@@ -957,6 +1007,29 @@ namespace KartogrammaPlugin
                         }
                     }
 
+                    // Плотный досэмплинг для узких зон перекрытия (тонкая траншея):
+                    // грубая 3×3 выборка выше могла не попасть в узкую полосу, и
+                    // ячейка осталась бы без данных → без объёма. Включаем при
+                    // ручных границах, а в авто-режиме — если сетка не гигантская
+                    // (защита от лишней нагрузки; порог как в DrawGridLines).
+                    bool allowDense = (_boundaryPts != null || _innerPtsList != null)
+                                      || (long)rows * cols <= 20000;
+                    if (allowDense && (!e1v.HasValue || !e2v.HasValue))
+                    {
+                        int ds = DenseOverlapSteps();
+                        for (int fi = 0; fi <= ds && (!e1v.HasValue || !e2v.HasValue); fi++)
+                        for (int fj = 0; fj <= ds && (!e1v.HasValue || !e2v.HasValue); fj++)
+                        {
+                            double flx = c * szX + fj * szX / ds;
+                            double fly = r * szY + fi * szY / ds;
+                            double fwx = _o.BaseX + flx * cosA - fly * sinA;
+                            double fwy = _o.BaseY + flx * sinA + fly * cosA;
+                            double? fe1 = GetElev(s1, fwx, fwy);
+                            double? fe2 = GetElev(s2, fwx, fwy);
+                            if (fe1.HasValue && fe2.HasValue) { e1v = fe1; e2v = fe2; }
+                        }
+                    }
+
                     var cell = new CellData { Row = r, Col = c };
                     if (e1v.HasValue && e2v.HasValue)
                     {
@@ -978,7 +1051,7 @@ namespace KartogrammaPlugin
         //  бинарный поиск точки пересечения границы и считается частичный объём.
         // ═══════════════════════════════════════════════════════════════════════
         private double CalcCellVolumeAccurate(int r, int c,
-            CivilSurface s1, CivilSurface s2, double cosA, double sinA)
+            CivilSurface s1, CivilSurface s2, double cosA, double sinA, out double cellArea)
         {
             double szX = _o.CellSizeX;
             double szY = _o.CellSizeY;
@@ -1015,6 +1088,7 @@ namespace KartogrammaPlugin
             }
 
             double vol = 0.0;
+            cellArea   = 0.0;
 
             for (int si = 0; si < n; si++)
             for (int sj = 0; sj < n; sj++)
@@ -1023,13 +1097,17 @@ namespace KartogrammaPlugin
                 vol += CalcSubTriVol(s1, s2,
                     wx[si,   sj  ], wy[si,   sj  ], h[si,   sj  ],
                     wx[si,   sj+1], wy[si,   sj+1], h[si,   sj+1],
-                    wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ]);
+                    wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ],
+                    out double aBL);
+                cellArea += aBL;
 
                 // Верхний правый треугольник: BR, TR, TL
                 vol += CalcSubTriVol(s1, s2,
                     wx[si,   sj+1], wy[si,   sj+1], h[si,   sj+1],
                     wx[si+1, sj+1], wy[si+1, sj+1], h[si+1, sj+1],
-                    wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ]);
+                    wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ],
+                    out double aTR);
+                cellArea += aTR;
             }
 
             return vol;
@@ -1130,8 +1208,10 @@ namespace KartogrammaPlugin
         private double CalcSubTriVol(CivilSurface s1, CivilSurface s2,
             double xA, double yA, double hA,
             double xB, double yB, double hB,
-            double xC, double yC, double hC)
+            double xC, double yC, double hC,
+            out double area)
         {
+            area = 0.0;
             bool aOk = !double.IsNaN(hA);
             bool bOk = !double.IsNaN(hB);
             bool cOk = !double.IsNaN(hC);
@@ -1143,7 +1223,10 @@ namespace KartogrammaPlugin
             if (fullArea < 1e-14) return 0.0;
 
             if (valid == 3)
+            {
+                area = fullArea;
                 return fullArea * (hA + hB + hC) / 3.0;
+            }
 
             if (valid == 2)
             {
@@ -1163,6 +1246,7 @@ namespace KartogrammaPlugin
                 // Делим на два треугольника: P-V1-V2 и P-V2-Q
                 double a1 = TriArea2D(pX, pY, xV1, yV1, xV2, yV2);
                 double a2 = TriArea2D(pX, pY, xV2, yV2, qX, qY);
+                area = a1 + a2;
                 return a1 * (hP + hV1 + hV2) / 3.0
                      + a2 * (hP + hV2 + hQ) / 3.0;
             }
@@ -1181,7 +1265,7 @@ namespace KartogrammaPlugin
                 var (qX, qY, hQ) = FindBoundaryPoint(s1, s2, xV, yV, xO2, yO2);
 
                 // Валидная область: треугольник V-P-Q
-                double area = TriArea2D(xV, yV, pX, pY, qX, qY);
+                area = TriArea2D(xV, yV, pX, pY, qX, qY);
                 return area * (hV + hP + hQ) / 3.0;
             }
 
@@ -1235,17 +1319,19 @@ namespace KartogrammaPlugin
         //  Проверяем сетку 3×3 точек (центр, углы, середины рёбер) —
         //  если хотя бы одна точка имеет данные на ОБЕИХ поверхностях, ячейка валидна.
         // ═══════════════════════════════════════════════════════════════════════
+        // steps — число интервалов по стороне ячейки (steps+1 узлов). По умолчанию
+        // 2 → грубая сетка 3×3 (углы + середины рёбер + центр). Для узких зон
+        // перекрытия (тонкие траншеи/бермы) вызывается с бо́льшим steps.
         private bool CellHasOverlap(int r, int c,
-            CivilSurface s1, CivilSurface s2, double cosA, double sinA)
+            CivilSurface s1, CivilSurface s2, double cosA, double sinA, int steps = 2)
         {
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
 
-            // 3×3 = 9 точек: углы + середины рёбер + центр
-            for (int i = 0; i <= 2; i++)
-            for (int j = 0; j <= 2; j++)
+            for (int i = 0; i <= steps; i++)
+            for (int j = 0; j <= steps; j++)
             {
-                double lx = c * szX + j * szX * 0.5;
-                double ly = r * szY + i * szY * 0.5;
+                double lx = c * szX + j * szX / steps;
+                double ly = r * szY + i * szY / steps;
                 double wx = _o.BaseX + lx * cosA - ly * sinA;
                 double wy = _o.BaseY + lx * sinA + ly * cosA;
 
@@ -1254,6 +1340,18 @@ namespace KartogrammaPlugin
             }
 
             return false;
+        }
+
+        // Плотность досэмплинга для узких зон перекрытия. Узкая полоса (например
+        // траншея шириной 0.8 м) может пройти между узлами грубой 3×3 выборки
+        // в крупной ячейке (10×10 м) — тогда ячейка ошибочно считается «нет
+        // перекрытия» и сетка не строится. Шаг привязан к субсетке объёма
+        // (VolumeNodeStep), но ограничен сверху ради производительности.
+        private int DenseOverlapSteps()
+        {
+            int n = (int)Math.Ceiling(
+                Math.Max(_o.CellSizeX, _o.CellSizeY) / Math.Max(_o.VolumeNodeStep, 1e-6));
+            return Clamp(n, 4, 40);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -1299,6 +1397,13 @@ namespace KartogrammaPlugin
 
             bool hasManualBounds = (outerProto != null && outerPts != null) || innerProtos.Count > 0;
 
+            // Плотный досэмплинг тонких зон перекрытия (узкая траншея, которую
+            // грубая 3×3 выборка пропускает). Включаем всегда при ручных границах,
+            // а в авто-режиме — если сетка не гигантская (защита от лишней нагрузки
+            // на очень больших авто-сетках). Порог с запасом покрывает реальные
+            // картограммы (до ~140×140 ячеек).
+            bool allowDense = hasManualBounds || (long)rows * cols <= 20000;
+
             for (int r = 0; r < rows; r++)
             {
                 for (int c = 0; c < cols; c++)
@@ -1310,22 +1415,22 @@ namespace KartogrammaPlugin
                     corners[2] = ToUcs2d(LW(x0 + szX, y0 + szY, cA, sA));
                     corners[3] = ToUcs2d(LW(x0,       y0 + szY, cA, sA));
 
-                    // Базовый фильтр: ячейка должна перекрываться обеими поверхностями
-                    if (!CellHasOverlap(r, c, s1, s2, cA, sA))
-                        continue;
-
+                    // Классификацию по границам делаем ДО проверки перекрытия,
+                    // чтобы не тратить плотный досэмплинг на ячейки, которые всё
+                    // равно отбрасываются (снаружи внешней границы или целиком в «дырке»).
+                    CellClass outerCls = CellClass.Inside;
+                    var partialInners = new List<Polyline>();
+                    bool insideAnyInner = false;
                     if (hasManualBounds)
                     {
                         // Классификация по внешней границе — работает всегда.
-                        CellClass outerCls = (outerPts != null)
+                        outerCls = (outerPts != null)
                             ? ClassifyCell(corners, outerPts)
                             : CellClass.Inside;
                         if (outerCls == CellClass.Outside) continue;
 
                         // Классификация по внутренним границам: если ячейка целиком
                         // внутри хотя бы одной — пропускаем; иначе собираем пересекающиеся.
-                        var partialInners = new List<Polyline>();
-                        bool insideAnyInner = false;
                         for (int k = 0; k < innerPtsList.Count; k++)
                         {
                             var iCls = ClassifyCell(corners, innerPtsList[k]);
@@ -1333,7 +1438,21 @@ namespace KartogrammaPlugin
                             if (iCls == CellClass.Partial) partialInners.Add(innerProtos[k]);
                         }
                         if (insideAnyInner) continue;
+                    }
 
+                    // Базовый фильтр: ячейка должна перекрываться обеими поверхностями.
+                    // Грубая 3×3 выборка может не заметить узкую полосу перекрытия
+                    // (тонкая траншея в крупной ячейке) — досэмплируем плотнее,
+                    // прежде чем отбросить ячейку.
+                    if (!CellHasOverlap(r, c, s1, s2, cA, sA))
+                    {
+                        if (!allowDense ||
+                            !CellHasOverlap(r, c, s1, s2, cA, sA, DenseOverlapSteps()))
+                            continue;
+                    }
+
+                    if (hasManualBounds)
+                    {
                         // Флаг DontClipCells управляет только тем, резать ли крайние
                         // ячейки. Если флаг включён — Partial-ячейки рисуются целиком.
                         bool needRegion = !_o.DontClipCells &&

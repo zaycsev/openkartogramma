@@ -86,7 +86,7 @@ administrator rights, and is driven from a single dialog opened by the
 
 ## Installation
 
-1. Download `Setup_openkartogramma_v1.1.1.exe` from the
+1. Download `Setup_openkartogramma_v1.1.2.exe` from the
    [latest release](https://github.com/zaycsev/openkartogramma/releases/latest).
 2. Close AutoCAD Civil 3D, run the installer, click **Next → Install → Finish**.
    The plugin installs to `%APPDATA%\Autodesk\ApplicationPlugins\` — no administrator
@@ -114,7 +114,7 @@ reference assemblies).
 
 ```powershell
 # both runtime builds + the installer (auto-detects Civil 3D and Inno Setup)
-.\build-installer.ps1 -Version "1.1.1"
+.\build-installer.ps1 -Version "1.1.2"
 ```
 
 The project targets `net48` and `net8.0-windows`; AutoCAD/Civil 3D managed

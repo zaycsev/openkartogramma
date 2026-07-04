@@ -123,13 +123,37 @@ if ($buildAcadPath) {
     Info "No Civil 3D DLLs found - MSBuild will auto-resolve (may fail)"
 }
 
-# -- 2. Build net48 (Civil 3D 2024 uses .NET Framework 4.8) -------------------
-Step "Building (net48)..."
+# -- 2. Close Civil 3D (ДО сборки!) ------------------------------------------
+#  Civil 3D держит загруженную DLL заблокированной — если собирать при
+#  запущенном C3D, шаг деплоя (копирование в ApplicationPlugins) падает с
+#  «file is being used by another process», и НОВАЯ сборка не попадает в бандл
+#  (в продукт грузится старая DLL). Поэтому сначала закрываем C3D, потом собираем.
+$acadProcs = Get-Process -Name "acad" -ErrorAction SilentlyContinue
+if ($acadProcs) {
+    Step "Closing Civil 3D..."
+    $acadProcs | ForEach-Object {
+        $_.CloseMainWindow() | Out-Null
+    }
+    $waited = 0
+    while ((Get-Process -Name "acad" -ErrorAction SilentlyContinue) -and $waited -lt 15) {
+        Start-Sleep -Milliseconds 500
+        $waited++
+        Write-Host "  .. waiting for close..." -ForegroundColor Gray
+    }
+    Get-Process -Name "acad" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Ok "Civil 3D closed"
+} else {
+    Info "Civil 3D was not running"
+}
+
+# -- 3. Build (обе версии: net48 для C3D 2015-2024, net8 для 2025+) -----------
+#  Собираем ОБА таргета, чтобы обновить именно ту DLL, которую грузит ваша
+#  версия Civil 3D, независимо от того, какая она.
+Step "Building (net48 + net8)..."
 $t = [Diagnostics.Stopwatch]::StartNew()
 
 dotnet build "$root\KartogrammaPlugin.csproj" `
     -c Debug `
-    -f net48 `
     --nologo -v minimal @buildProps
 
 $t.Stop()
@@ -147,25 +171,6 @@ $pcDst = "$bundleRoot\PackageContents.xml"
 if ((Test-Path $pcSrc) -and -not (Test-Path $pcDst)) {
     Copy-Item $pcSrc $pcDst
     Ok "PackageContents.xml copied to bundle"
-}
-
-# -- 3. Close Civil 3D --------------------------------------------------------
-$acadProcs = Get-Process -Name "acad" -ErrorAction SilentlyContinue
-if ($acadProcs) {
-    Step "Closing Civil 3D..."
-    $acadProcs | ForEach-Object {
-        $_.CloseMainWindow() | Out-Null
-    }
-    $waited = 0
-    while ((Get-Process -Name "acad" -ErrorAction SilentlyContinue) -and $waited -lt 15) {
-        Start-Sleep -Milliseconds 500
-        $waited++
-        Write-Host "  .. waiting for close..." -ForegroundColor Gray
-    }
-    Get-Process -Name "acad" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Ok "Civil 3D closed"
-} else {
-    Info "Civil 3D was not running"
 }
 
 # -- 4. Launch Civil 3D -------------------------------------------------------

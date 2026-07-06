@@ -72,6 +72,9 @@ namespace KartogrammaPlugin
                     return;
                 }
 
+                // Снимки TIN в память — до всех циклов с отметками
+                PrepareElevationCache(surf1!, surf2!);
+
                 // Границы грузим ДО CalcAutoGrid — они задают габариты сетки.
                 LoadManualBoundaries(trans);
 
@@ -122,6 +125,9 @@ namespace KartogrammaPlugin
                     ed.WriteMessage("\n[Картограмма] Ошибка: поверхности не найдены.");
                     return;
                 }
+
+                // Снимки TIN в память — до всех циклов с отметками
+                PrepareElevationCache(surf1!, surf2!);
 
                 // Границы грузим ДО CalcAutoGrid — они задают габариты сетки.
                 LoadManualBoundaries(trans);
@@ -201,35 +207,58 @@ namespace KartogrammaPlugin
                     Report($"Расчёт объёмов ({totalCells} ячеек)…", 10);
                 }
 
-                double totalArea = 0;
-                int cellsDone = 0;
-                foreach (var dc in dataCells)
+                // ── Фаза 1: численное интегрирование объёмов ──────────────────────
+                // Ячейки независимы. Когда обе поверхности — TIN со снимком в
+                // памяти (PrepareElevationCache), расчёт чисто вычислительный, без
+                // COM-вызовов AutoCAD — можно параллелить по ядрам. Прогресс
+                // репортим из основного потока между чанками. Фолбэк (GridSurface
+                // и т.п.) идёт последовательно — Civil API не потокобезопасен.
+                var volRes  = new double[totalCells];
+                var areaRes = new double[totalCells];
+
+                void ComputeCell(int i)
                 {
-                    int r = dc.Row, c = dc.Col;
+                    var dc = dataCells[i];
                     // Объём: два метода по выбору пользователя.
                     //   Triangulation — субтреугольная разбивка, точно.
                     //   Squares       — классический ручной метод S×(h1+h2+h3+h4)/4
                     //                   по отметкам в 4 углах ячейки.
-                    double vol, cellArea;
+                    // Площадь (для Triangulation) берём из ТОЙ ЖЕ субтреугольной
+                    // интеграции, что и объём — она согласована с объёмом и
+                    // совпадает с площадью из «пульта объёмов» Civil.
                     if (_o.VolumeMethod == VolumeMethod.Squares)
                     {
-                        vol      = CalcCellVolumeSquares(r, c, surf1!, surf2!, cosA, sinA);
-                        cellArea = CalcCellEffectiveArea (r, c, surf1!, surf2!, cosA, sinA);
+                        volRes[i]  = CalcCellVolumeSquares(dc.Row, dc.Col, surf1!, surf2!, cosA, sinA);
+                        areaRes[i] = CalcCellEffectiveArea(dc.Row, dc.Col, surf1!, surf2!, cosA, sinA);
                     }
                     else
                     {
-                        // Площадь берём из ТОЙ ЖЕ субтреугольной интеграции, что и
-                        // объём — она согласована с объёмом и совпадает с площадью
-                        // из «пульта объёмов» Civil (композитная площадь перекрытия),
-                        // а не считается отдельной грубой выборкой 20×20.
-                        vol = CalcCellVolumeAccurate(r, c, surf1!, surf2!, cosA, sinA,
-                            out cellArea);
+                        volRes[i] = CalcCellVolumeAccurate(dc.Row, dc.Col, surf1!, surf2!,
+                            cosA, sinA, out areaRes[i]);
                     }
-                    cellsDone++;
+                }
 
-                    if (cellsDone % 50 == 0 || cellsDone == totalCells)
-                        Report($"Объём: {cellsDone}/{totalCells} ячеек…",
-                            10 + (int)(80.0 * cellsDone / totalCells));
+                bool canParallel = _snap1 != null && _snap2 != null;
+                const int Chunk = 64;
+                for (int start = 0; start < totalCells; start += Chunk)
+                {
+                    int end = Math.Min(start + Chunk, totalCells);
+                    if (canParallel)
+                        System.Threading.Tasks.Parallel.For(start, end, ComputeCell);
+                    else
+                        for (int i = start; i < end; i++) ComputeCell(i);
+
+                    Report($"Объём: {end}/{totalCells} ячеек…",
+                        10 + (int)(80.0 * end / totalCells));
+                }
+
+                // ── Фаза 2: подписи и итоги (последовательно — работа с чертежом) ──
+                double totalArea = 0;
+                for (int ci = 0; ci < totalCells; ci++)
+                {
+                    var dc = dataCells[ci];
+                    int r = dc.Row, c = dc.Col;
+                    double vol = volRes[ci], cellArea = areaRes[ci];
 
                     // Площадь перекрытия суммируем независимо от порога объёма
                     // (как в Civil — площадь не зависит от отсечения малых объёмов).
@@ -555,6 +584,108 @@ namespace KartogrammaPlugin
         }
 
         // ═══════════════════════════════════════════════════════════════════════
+        //  Ручная тройка отметок в произвольной точке чертежа (кнопка-«перекрестье»
+        //  в разделе «Отметки»). Рисует ту же тройку (рабочая / проектная / чёрная),
+        //  что и в узлах сетки — те же слои, стиль, высота, точность и угол — плюс
+        //  крестик-маркер точки (в узлах его роль играют линии сетки).
+        //  Возвращает false, если в точке нет отметок обеих поверхностей.
+        // ═══════════════════════════════════════════════════════════════════════
+        public bool DrawManualTriple(Point3d pt)
+        {
+            var ed = _doc.Editor;
+            try
+            {
+                var civilDoc = CivilApplication.ActiveDocument;
+                using var trans = _db.TransactionManager.StartTransaction();
+
+                if (!FindSurfaces(trans, civilDoc, out var surf1, out var surf2))
+                {
+                    ed.WriteMessage("\n[Картограмма] Ошибка: поверхности не найдены.");
+                    return false;
+                }
+
+                double? e1 = GetElevS(surf1!, pt.X, pt.Y);
+                double? e2 = GetElevS(surf2!, pt.X, pt.Y);
+                if (!e1.HasValue || !e2.HasValue) return false;
+
+                var tst = (TextStyleTable)trans.GetObject(_db.TextStyleTableId, OpenMode.ForRead);
+                _tsId = tst.Has(_o.TextStyleName) ? tst[_o.TextStyleName] : _db.Textstyle;
+
+                EnsureLayer(trans, _o.WorkLayerName,   _o.ColorWork);
+                EnsureLayer(trans, _o.ExistLayerName,  _o.ColorExisting);
+                EnsureLayer(trans, _o.DesignLayerName, _o.ColorDesign);
+
+                var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+                _ms = (BlockTableRecord)trans.GetObject(
+                    bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                double ang = _o.RotationRadians;
+                double cA  = Math.Cos(ang), sA = Math.Sin(ang);
+
+                // Локальные координаты точки в системе сетки — обратное к LW
+                // преобразование; дальше раскладка текстов идентична DrawNodeLabel.
+                double dxw = pt.X - _o.BaseX, dyw = pt.Y - _o.BaseY;
+                double nx  =  dxw * cA + dyw * sA;
+                double ny  = -dxw * sA + dyw * cA;
+
+                double sh     = _o.SmallTextHeight;
+                string fmt    = "F" + _o.TextPrecision;
+                double margin = sh * 0.15;
+                double work   = e2.Value - e1.Value;
+
+                // Рабочая — справа-налево, выше и левее точки
+                AddRightAlignedText(trans, _o.WorkLayerName,
+                    LW(nx - margin, ny + margin, cA, sA),
+                    Signed(work, _o.TextPrecision), sh, ang, _o.ColorWork, _o.HideMaskText);
+
+                // Проектная — слева-направо, выше и правее точки
+                AddTextToLayer(trans, _o.DesignLayerName,
+                    LW(nx + margin, ny + margin, cA, sA),
+                    e2.Value.ToString(fmt), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText);
+
+                // Существующая — слева-направо, ниже и правее точки
+                AddTextToLayer(trans, _o.ExistLayerName,
+                    LW(nx + margin, ny - margin - sh, cA, sA),
+                    e1.Value.ToString(fmt), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText);
+
+                // Крестик-маркер точки — как «+»-маркер выноски, по углу сетки.
+                // Кладём на слой рабочих отметок (живёт и удаляется вместе с
+                // тройкой), но цвет — стандартный белый/чёрный AutoCAD (ACI 7),
+                // чтобы крестик читался как узел сетки, а не как рабочая отметка.
+                double arm = sh * 1.2;
+                var lineH = new Line(
+                    new Point3d(pt.X - arm * cA, pt.Y - arm * sA, 0),
+                    new Point3d(pt.X + arm * cA, pt.Y + arm * sA, 0))
+                {
+                    Layer = _o.WorkLayerName,
+                    Color = Color.FromColorIndex(ColorMethod.ByAci, 7)
+                };
+                var lineV = new Line(
+                    new Point3d(pt.X + arm * sA, pt.Y - arm * cA, 0),
+                    new Point3d(pt.X - arm * sA, pt.Y + arm * cA, 0))
+                {
+                    Layer = _o.WorkLayerName,
+                    Color = Color.FromColorIndex(ColorMethod.ByAci, 7)
+                };
+                _ms.AppendEntity(lineH);
+                _ms.AppendEntity(lineV);
+                trans.AddNewlyCreatedDBObject(lineH, true);
+                trans.AddNewlyCreatedDBObject(lineV, true);
+
+                trans.Commit();
+                ed.WriteMessage(
+                    $"\n[Картограмма] Тройка: чёрная {e1.Value.ToString(fmt)}, " +
+                    $"красная {e2.Value.ToString(fmt)}, рабочая {Signed(work, _o.TextPrecision)}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ed.WriteMessage($"\n[Картограмма] ОШИБКА тройки отметок: {ex.Message}");
+                return false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
         //  Перерисовка «в существующем» — обновляет визуальные свойства
         //  (цвета, высоты, стили текста) у уже размещённых объектов картограммы
         //  без полной перестройки. Структурные параметры (геометрия, точность,
@@ -724,26 +855,43 @@ namespace KartogrammaPlugin
         {
             _boundaryPts  = null;
             _innerPtsList = null;
-            if (_o.AutoBounds) return;
+            if (_o.AutoBounds) { UpdateBoundaryBbox(); return; }
 
-            if (!_o.OuterBoundaryId.IsNull)
-            {
-                var bndPl = trans.GetObject(_o.OuterBoundaryId, OpenMode.ForRead) as Polyline;
-                if (bndPl != null && bndPl.Closed)
-                    _boundaryPts = GetPolylinePoints(bndPl);
-            }
+            _boundaryPts = GetBoundaryPoints(trans, _o.OuterBoundaryId);
 
             if (_o.InnerBoundaryIds != null && _o.InnerBoundaryIds.Count > 0)
             {
                 _innerPtsList = new List<List<Point2d>>();
                 foreach (var innerId in _o.InnerBoundaryIds)
                 {
-                    if (innerId.IsNull) continue;
-                    var ipl = trans.GetObject(innerId, OpenMode.ForRead) as Polyline;
-                    if (ipl != null && ipl.Closed)
-                        _innerPtsList.Add(GetPolylinePoints(ipl));
+                    var ipts = GetBoundaryPoints(trans, innerId);
+                    if (ipts != null)
+                        _innerPtsList.Add(ipts);
                 }
             }
+
+            UpdateBoundaryBbox();
+        }
+
+        // Габариты наружной границы — быстрый отсев в IsInClipRegion до дорогого
+        // point-in-polygon (граница после аппроксимации дуг может иметь сотни
+        // вершин, а проверка зовётся на каждый субузел объёмной интеграции).
+        private double _bndMinX, _bndMinY, _bndMaxX, _bndMaxY;
+
+        private void UpdateBoundaryBbox()
+        {
+            _bndMinX = double.MinValue; _bndMinY = double.MinValue;
+            _bndMaxX = double.MaxValue; _bndMaxY = double.MaxValue;
+            if (_boundaryPts == null || _boundaryPts.Count == 0) return;
+
+            double mnx = double.MaxValue, mny = double.MaxValue;
+            double mxx = double.MinValue, mxy = double.MinValue;
+            foreach (var p in _boundaryPts)
+            {
+                if (p.X < mnx) mnx = p.X; if (p.X > mxx) mxx = p.X;
+                if (p.Y < mny) mny = p.Y; if (p.Y > mxy) mxy = p.Y;
+            }
+            _bndMinX = mnx; _bndMinY = mny; _bndMaxX = mxx; _bndMaxY = mxy;
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -789,16 +937,11 @@ namespace KartogrammaPlugin
                 }
 
                 double gW = gMaxLX - gMinLX, gH = gMaxLY - gMinLY;
-                cols = Clamp((int)Math.Ceiling(gW / sx), 1, 500);
-                rows = Clamp((int)Math.Ceiling(gH / sy), 1, 500);
+                LayoutGridAxis(gMinLX, gMaxLX, sx, out cols, out double gBaseLX);
+                LayoutGridAxis(gMinLY, gMaxLY, sy, out rows, out double gBaseLY);
 
                 if (_o.AutoBasePoint)
-                {
-                    // Центрируем: излишек (сетка чуть больше границы) поровну с двух сторон
-                    double excessX = cols * sx - gW;
-                    double excessY = rows * sy - gH;
-                    SetBaseFromLocal(gMinLX - excessX / 2.0, gMinLY - excessY / 2.0, cosA, sinA);
-                }
+                    SetBaseFromLocal(gBaseLX, gBaseLY, cosA, sinA);
 
                 ed.WriteMessage(
                     $"\n[Картограмма] Габариты по внешней границе: {gW:F3}×{gH:F3} м → {cols}×{rows} ячеек");
@@ -849,14 +992,14 @@ namespace KartogrammaPlugin
             {
                 ed.WriteMessage($"\n[Картограмма] Анализирую {tin1.Vertices.Count} вершин '{s1.Name}'...");
                 foreach (TinSurfaceVertex v in tin1.Vertices)
-                    if (GetElev(s2, v.Location.X, v.Location.Y).HasValue)
+                    if (GetElevS(s2, v.Location.X, v.Location.Y).HasValue)
                         UpdateBounds(v.Location.X, v.Location.Y);
             }
             if (s2 is TinSurface tin2 && tin2.Vertices.Count > 0)
             {
                 ed.WriteMessage($"\n[Картограмма] Анализирую {tin2.Vertices.Count} вершин '{s2.Name}'...");
                 foreach (TinSurfaceVertex v in tin2.Vertices)
-                    if (GetElev(s1, v.Location.X, v.Location.Y).HasValue)
+                    if (GetElevS(s1, v.Location.X, v.Location.Y).HasValue)
                         UpdateBounds(v.Location.X, v.Location.Y);
             }
 
@@ -878,7 +1021,7 @@ namespace KartogrammaPlugin
                     for (int j = 0; j <= NS; j++)
                     {
                         double wx = mnX + j * stX, wy = mnY + i * stY;
-                        if (GetElev(s1, wx, wy).HasValue && GetElev(s2, wx, wy).HasValue)
+                        if (GetElevS(s1, wx, wy).HasValue && GetElevS(s2, wx, wy).HasValue)
                             UpdateBounds(wx, wy);
                     }
                 }
@@ -896,27 +1039,49 @@ namespace KartogrammaPlugin
                 return;
             }
 
-            // Габариты берём РОВНО по зоне перекрытия — вершины поверхностей уже
-            // очерчивают фактические данные. Прежний «отступ в полклетки с каждой
-            // стороны» раздувал сетку на целую лишнюю ячейку и сдвигал её на
-            // полклетки, из-за чего повёрнутая узкая траншея заполнялась хуже
-            // (например 6 из 20 ячеек вместо 10 из 12). Теперь авто-габариты
-            // совпадают с ручной внешней границей той же зоны.
+            // Зона перекрытия найдена по вершинам поверхностей — она очерчивает
+            // фактические данные. Раскладку ячеек внутри зоны делает LayoutGridAxis
+            // (целые квадраты в середине + симметричные краевые обрезки).
             double realW = maxLX - minLX;
             double realH = maxLY - minLY;
             ed.WriteMessage($"\n[Картограмма] Зона (локальная): {realW:F3}×{realH:F3} м");
 
-            cols = Clamp((int)Math.Ceiling(realW / sx), 1, 500);
-            rows = Clamp((int)Math.Ceiling(realH / sy), 1, 500);
+            LayoutGridAxis(minLX, maxLX, sx, out cols, out double baseLX);
+            LayoutGridAxis(minLY, maxLY, sy, out rows, out double baseLY);
 
             if (_o.AutoBasePoint)
             {
-                // Центрируем: излишек равномерно по обеим сторонам
-                double excessX = cols * sx - realW;
-                double excessY = rows * sy - realH;
-                SetBaseFromLocal(minLX - excessX / 2.0, minLY - excessY / 2.0, cosA, sinA);
+                SetBaseFromLocal(baseLX, baseLY, cosA, sinA);
                 ed.WriteMessage($"\n[Картограмма] Базовая точка (авто, угол {_o.RotationDegrees:F4}°): X={_o.BaseX:F3}, Y={_o.BaseY:F3}");
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Раскладка сетки по одной оси: сколько ячеек и где начало сетки.
+        //  Объединяет поведение 1.1.1 (котлован) и 1.1.2 (узкая траншея):
+        //    • зона у́же одной ячейки (узкая траншея) → 1 ячейка, зона по центру —
+        //      траншея целиком сидит в одном ряду, а не на стыке двух;
+        //    • ширина зоны кратна шагу → ровно n ячеек, сетка совпадает с
+        //      границей зоны (точная посадка);
+        //    • иначе → n целых ячеек в середине зоны + два симметричных краевых
+        //      обрезка (как в 1.1.1): внутренность замощена целыми квадратами,
+        //      граница режет только тонкие краевые полосы — читаемо, отметки
+        //      ложатся и на целые квадраты, и на бровку.
+        // ═══════════════════════════════════════════════════════════════════════
+        internal static void LayoutGridAxis(double zoneMin, double zoneMax, double step,
+            out int count, out double gridMin)
+        {
+            double w = Math.Max(zoneMax - zoneMin, 0.0);
+            const double tol = 1e-3;                    // 1 мм: считаем «кратно шагу»
+            int n = (int)Math.Floor(w / step + 1e-9);
+            double rem = w - n * step;
+
+            if      (n <= 0)     count = 1;             // зона у́же одной ячейки
+            else if (rem <= tol) count = n;             // точная посадка
+            else                 count = n + 2;         // n целых + 2 краевых обрезка
+            count = Clamp(count, 1, 500);
+
+            gridMin = zoneMin - (count * step - w) / 2.0;   // излишек поровну с двух сторон
         }
 
         // Перевод локальной точки (в системе с мировым origin) в мировую базовую точку сетки.
@@ -985,8 +1150,8 @@ namespace KartogrammaPlugin
                     double wx = _o.BaseX + lx * cosA - ly * sinA;
                     double wy = _o.BaseY + lx * sinA + ly * cosA;
 
-                    double? e1v = GetElev(s1, wx, wy);
-                    double? e2v = GetElev(s2, wx, wy);
+                    double? e1v = GetElevS(s1, wx, wy);
+                    double? e2v = GetElevS(s2, wx, wy);
 
                     // Для граничных ячеек: центр может быть вне поверхности,
                     // но ячейка всё равно имеет объём. Перебираем те же 8 точек
@@ -1001,8 +1166,8 @@ namespace KartogrammaPlugin
                             double fly = r * szY + fi * szY * 0.5;
                             double fwx = _o.BaseX + flx * cosA - fly * sinA;
                             double fwy = _o.BaseY + flx * sinA + fly * cosA;
-                            double? fe1 = GetElev(s1, fwx, fwy);
-                            double? fe2 = GetElev(s2, fwx, fwy);
+                            double? fe1 = GetElevS(s1, fwx, fwy);
+                            double? fe2 = GetElevS(s2, fwx, fwy);
                             if (fe1.HasValue && fe2.HasValue) { e1v = fe1; e2v = fe2; }
                         }
                     }
@@ -1024,8 +1189,8 @@ namespace KartogrammaPlugin
                             double fly = r * szY + fi * szY / ds;
                             double fwx = _o.BaseX + flx * cosA - fly * sinA;
                             double fwy = _o.BaseY + flx * sinA + fly * cosA;
-                            double? fe1 = GetElev(s1, fwx, fwy);
-                            double? fe2 = GetElev(s2, fwx, fwy);
+                            double? fe1 = GetElevS(s1, fwx, fwy);
+                            double? fe2 = GetElevS(s2, fwx, fwy);
                             if (fe1.HasValue && fe2.HasValue) { e1v = fe1; e2v = fe2; }
                         }
                     }
@@ -1073,8 +1238,8 @@ namespace KartogrammaPlugin
                 wx[si, sj] = _o.BaseX + lx * cosA - ly * sinA;
                 wy[si, sj] = _o.BaseY + lx * sinA + ly * cosA;
 
-                double? e1 = GetElev(s1, wx[si, sj], wy[si, sj]);
-                double? e2 = GetElev(s2, wx[si, sj], wy[si, sj]);
+                double? e1 = GetElevS(s1, wx[si, sj], wy[si, sj]);
+                double? e2 = GetElevS(s2, wx[si, sj], wy[si, sj]);
 
                 // Точки вне допустимой области помечаются как NaN — CalcSubTriVol
                 // обрезает субтреугольники на краю через бинарный поиск
@@ -1134,8 +1299,8 @@ namespace KartogrammaPlugin
                 double ly = (r + dy) * szY;
                 double wx = _o.BaseX + lx * cosA - ly * sinA;
                 double wy = _o.BaseY + lx * sinA + ly * cosA;
-                double? e1 = GetElev(s1, wx, wy);
-                double? e2 = GetElev(s2, wx, wy);
+                double? e1 = GetElevS(s1, wx, wy);
+                double? e2 = GetElevS(s2, wx, wy);
                 if (!e1.HasValue || !e2.HasValue) continue;
                 sum += e2.Value - e1.Value;
                 cnt++;
@@ -1190,8 +1355,8 @@ namespace KartogrammaPlugin
                 double wx = _o.BaseX + lx * cosA - ly * sinA;
                 double wy = _o.BaseY + lx * sinA + ly * cosA;
 
-                if (!GetElev(s1, wx, wy).HasValue) continue;
-                if (!GetElev(s2, wx, wy).HasValue) continue;
+                if (!GetElevS(s1, wx, wy).HasValue) continue;
+                if (!GetElevS(s2, wx, wy).HasValue) continue;
                 if (!IsInClipRegion(wx, wy)) continue;
 
                 inside++;
@@ -1296,8 +1461,8 @@ namespace KartogrammaPlugin
             {
                 double midX = (loX + hiX) * 0.5;
                 double midY = (loY + hiY) * 0.5;
-                double? e1  = GetElev(s1, midX, midY);
-                double? e2  = GetElev(s2, midX, midY);
+                double? e1  = GetElevS(s1, midX, midY);
+                double? e2  = GetElevS(s2, midX, midY);
                 // Точка считается валидной только если обе поверхности
                 // имеют данные И точка внутри полигонных границ.
                 if (e1.HasValue && e2.HasValue && IsInBounds(midX, midY))
@@ -1307,8 +1472,8 @@ namespace KartogrammaPlugin
             }
 
             // Берём последнюю валидную точку как граничную
-            double? h1 = GetElev(s1, loX, loY);
-            double? h2 = GetElev(s2, loX, loY);
+            double? h1 = GetElevS(s1, loX, loY);
+            double? h2 = GetElevS(s2, loX, loY);
             double hBnd = (h1.HasValue && h2.HasValue && IsInBounds(loX, loY))
                 ? h2.Value - h1.Value : 0.0;
             return (loX, loY, hBnd);
@@ -1335,7 +1500,7 @@ namespace KartogrammaPlugin
                 double wx = _o.BaseX + lx * cosA - ly * sinA;
                 double wy = _o.BaseY + lx * sinA + ly * cosA;
 
-                if (GetElev(s1, wx, wy).HasValue && GetElev(s2, wx, wy).HasValue)
+                if (GetElevS(s1, wx, wy).HasValue && GetElevS(s2, wx, wy).HasValue)
                     return true;
             }
 
@@ -1369,14 +1534,11 @@ namespace KartogrammaPlugin
             // обязательно для Region.BooleanOperation, иначе eNonCoplanarGeometry.
             Polyline? outerProto = null;
             List<Point2d>? outerPts = null;
-            if (!_o.AutoBounds && !_o.OuterBoundaryId.IsNull)
+            if (!_o.AutoBounds)
             {
-                var bndPl = t.GetObject(_o.OuterBoundaryId, OpenMode.ForRead) as Polyline;
-                if (bndPl != null && bndPl.Closed)
-                {
-                    outerProto = BuildFlatPolyline(bndPl);
-                    outerPts   = GetPolylinePoints(bndPl);
-                }
+                outerPts = GetBoundaryPoints(t, _o.OuterBoundaryId);
+                if (outerPts != null)
+                    outerProto = BuildFlatPolyline(outerPts);
             }
 
             var innerProtos = new List<Polyline>();
@@ -1385,12 +1547,11 @@ namespace KartogrammaPlugin
             {
                 foreach (var innerId in _o.InnerBoundaryIds)
                 {
-                    if (innerId.IsNull) continue;
-                    var ipl = t.GetObject(innerId, OpenMode.ForRead) as Polyline;
-                    if (ipl != null && ipl.Closed)
+                    var ipts = GetBoundaryPoints(t, innerId);
+                    if (ipts != null)
                     {
-                        innerProtos.Add(BuildFlatPolyline(ipl));
-                        innerPtsList.Add(GetPolylinePoints(ipl));
+                        innerProtos.Add(BuildFlatPolyline(ipts));
+                        innerPtsList.Add(ipts);
                     }
                 }
             }
@@ -1493,15 +1654,13 @@ namespace KartogrammaPlugin
             return drawn;
         }
 
-        /// <summary>Построить плоскую копию полилинии в WCS Z=0 (для Region).</summary>
-        private static Polyline BuildFlatPolyline(Polyline src)
+        /// <summary>Построить плоскую замкнутую полилинию в WCS Z=0 из точек
+        /// контура (для Region). Точки — из GetBoundaryPoints, уже в WCS.</summary>
+        private static Polyline BuildFlatPolyline(List<Point2d> pts)
         {
             var p = new Polyline();
-            for (int i = 0; i < src.NumberOfVertices; i++)
-            {
-                var p3 = src.GetPoint3dAt(i); // WCS
-                p.AddVertexAt(i, new Point2d(p3.X, p3.Y), 0, 0, 0);
-            }
+            for (int i = 0; i < pts.Count; i++)
+                p.AddVertexAt(i, pts[i], 0, 0, 0);
             p.Closed = true;
             return p;
         }
@@ -1763,8 +1922,8 @@ namespace KartogrammaPlugin
 
                 double wx = _o.BaseX + lx * cA - ly * sA;
                 double wy = _o.BaseY + lx * sA + ly * cA;
-                double? e1 = GetElev(s1, wx, wy);
-                double? e2 = GetElev(s2, wx, wy);
+                double? e1 = GetElevS(s1, wx, wy);
+                double? e2 = GetElevS(s2, wx, wy);
                 if (!e1.HasValue || !e2.HasValue) return;
 
                 double sh      = _o.SmallTextHeight;
@@ -1803,42 +1962,65 @@ namespace KartogrammaPlugin
 
         /// <summary>
         /// Подбирает якорь метки, гарантированно попадающий внутрь клип-области
-        /// (наружная граница минус внутренние «дырки»). Если исходная точка уже
-        /// внутри — возвращает её. Иначе сэмплирует 7×7 точек по ячейке и берёт
-        /// ближайшую к исходной, прошедшую IsInBounds. Если подходящих нет —
-        /// возвращает исходную (fallback). В режиме без границ — всегда исходная.
+        /// (наружная граница минус внутренние «дырки»). Проверка чисто
+        /// геометрическая (IsInClipRegion) и работает в ОБОИХ режимах — даже в
+        /// «Не обрезать» цифра объёма не должна улетать за заданные границы
+        /// (у траншеи-рамки центр крупной ячейки часто в «дырке» или снаружи).
+        /// Если исходная точка уже внутри — возвращает её. Иначе сэмплирует
+        /// ячейку плотно (шаг как у DenseOverlapSteps — чтобы не промахнуться
+        /// мимо узкой полосы траншеи) и ставит якорь в центроид попавших внутрь
+        /// точек — цифра ложится по середине видимого куска ячейки, а не на его
+        /// край. Если центроид сам вне области (L-образный кусок в углу рамки) —
+        /// берётся ближайшая к нему внутренняя точка. Если внутренних точек нет —
+        /// исходная (fallback). В режиме без границ — всегда исходная.
         /// </summary>
         private void FindInsideAnchor(
             double cellX0, double cellY0, double szX, double szY,
             double ancLx, double ancLy, double cA, double sA,
             out double outLx, out double outLy)
         {
+            outLx = ancLx; outLy = ancLy;
+            if (_boundaryPts == null && _innerPtsList == null) return;
+
             double awx = _o.BaseX + ancLx * cA - ancLy * sA;
             double awy = _o.BaseY + ancLx * sA + ancLy * cA;
-            if (IsInBounds(awx, awy))
+            if (IsInClipRegion(awx, awy)) return;
+
+            int n = Math.Max(7, DenseOverlapSteps());
+            var inLx = new List<double>(n * n);
+            var inLy = new List<double>(n * n);
+            for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
             {
-                outLx = ancLx; outLy = ancLy;
+                double lx = cellX0 + szX * (j + 0.5) / n;
+                double ly = cellY0 + szY * (i + 0.5) / n;
+                double wx = _o.BaseX + lx * cA - ly * sA;
+                double wy = _o.BaseY + lx * sA + ly * cA;
+                if (!IsInClipRegion(wx, wy)) continue;
+                inLx.Add(lx); inLy.Add(ly);
+            }
+            if (inLx.Count == 0) return;               // fallback: исходная точка
+
+            double cxL = 0, cyL = 0;
+            for (int k = 0; k < inLx.Count; k++) { cxL += inLx[k]; cyL += inLy[k]; }
+            cxL /= inLx.Count; cyL /= inLx.Count;
+
+            double cwx = _o.BaseX + cxL * cA - cyL * sA;
+            double cwy = _o.BaseY + cxL * sA + cyL * cA;
+            if (IsInClipRegion(cwx, cwy))
+            {
+                outLx = cxL; outLy = cyL;
                 return;
             }
 
-            const int N = 7;
+            // Центроид вне области (вогнутый кусок) — ближайшая к нему внутренняя
             double best = double.MaxValue;
-            double bx = ancLx, by = ancLy;
-            bool found = false;
-            for (int i = 0; i < N; i++)
-            for (int j = 0; j < N; j++)
+            for (int k = 0; k < inLx.Count; k++)
             {
-                double lx = cellX0 + szX * (j + 0.5) / N;
-                double ly = cellY0 + szY * (i + 0.5) / N;
-                double wx = _o.BaseX + lx * cA - ly * sA;
-                double wy = _o.BaseY + lx * sA + ly * cA;
-                if (!IsInBounds(wx, wy)) continue;
-                double dx = lx - ancLx, dy = ly - ancLy;
+                double dx = inLx[k] - cxL, dy = inLy[k] - cyL;
                 double d2 = dx * dx + dy * dy;
-                if (d2 < best) { best = d2; bx = lx; by = ly; found = true; }
+                if (d2 < best) { best = d2; outLx = inLx[k]; outLy = inLy[k]; }
             }
-            outLx = found ? bx : ancLx;
-            outLy = found ? by : ancLy;
         }
 
         /// <summary>
@@ -1871,8 +2053,8 @@ namespace KartogrammaPlugin
                 if (!IsInClipRegion(wx, wy)) return;
             }
 
-            double? e1 = GetElev(s1, wx, wy);
-            double? e2 = GetElev(s2, wx, wy);
+            double? e1 = GetElevS(s1, wx, wy);
+            double? e2 = GetElevS(s2, wx, wy);
             if (!e1.HasValue || !e2.HasValue) return;
 
             double sh      = _o.SmallTextHeight;
@@ -2295,6 +2477,38 @@ namespace KartogrammaPlugin
             catch { return null; }
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Быстрые отметки: снимок TIN в памяти вместо COM-вызова FindElevationAtXY
+        //  на каждый субузел (их сотни тысяч за расчёт; каждый промах у границы —
+        //  ещё и дорогое .NET-исключение). Снимки строятся один раз за операцию в
+        //  PrepareElevationCache; GetElevS прозрачно падает обратно на GetElev для
+        //  поверхностей без снимка (GridSurface и т.п.).
+        // ═══════════════════════════════════════════════════════════════════════
+        private TinSnapshot?  _snap1,     _snap2;
+        private CivilSurface? _snapSurf1, _snapSurf2;
+
+        private void PrepareElevationCache(CivilSurface s1, CivilSurface s2)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _snap1 = s1 is TinSurface t1 ? TinSnapshot.Build(t1) : null;
+            _snap2 = s2 is TinSurface t2 ? TinSnapshot.Build(t2) : null;
+            _snapSurf1 = _snap1 != null ? s1 : null;
+            _snapSurf2 = _snap2 != null ? s2 : null;
+            if (_snap1 != null || _snap2 != null)
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] Кеш поверхностей: {_snap1?.TriangleCount ?? 0} + " +
+                    $"{_snap2?.TriangleCount ?? 0} треугольников за {sw.ElapsedMilliseconds} мс");
+        }
+
+        /// <summary>Отметка поверхности: из снимка (быстро, потокобезопасно),
+        /// для поверхностей без снимка — обычный GetElev через Civil API.</summary>
+        private double? GetElevS(CivilSurface surf, double x, double y)
+        {
+            if (ReferenceEquals(surf, _snapSurf1)) return _snap1!.Elevation(x, y);
+            if (ReferenceEquals(surf, _snapSurf2)) return _snap2!.Elevation(x, y);
+            return GetElev(surf, x, y);
+        }
+
         private void EnsureLayer(Transaction trans, string name, int aci)
         {
             var lt = (LayerTable)trans.GetObject(_db.LayerTableId, OpenMode.ForWrite);
@@ -2422,20 +2636,174 @@ namespace KartogrammaPlugin
         internal enum CellClass { Inside, Outside, Partial }
 
         /// <summary>Извлечь вершины полилинии в список Point2d (нормализовано CCW)</summary>
-        private static List<Point2d> GetPolylinePoints(Polyline pl)
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Универсальное извлечение замкнутого контура границы из объекта чертежа.
+        //  Поддерживаются: 2D-полилиния (Polyline), 3D-полилиния (Polyline3d) и
+        //  характерная линия Civil 3D (FeatureLine). Контур проецируется на план
+        //  (Z отбрасывается), дуги идут хордами по вершинам — как и раньше для
+        //  бульжей Polyline. Замкнутость: либо флаг Closed, либо конец совпадает
+        //  с началом (часто 3D-полилинии и характерные линии рисуют с привязкой
+        //  к первой точке, не замыкая флагом). Возвращает CCW-кольцо или null,
+        //  если объект не поддерживается / не замкнут / вырожден.
+        // ═══════════════════════════════════════════════════════════════════════
+        internal static List<Point2d>? GetBoundaryPoints(Transaction trans, ObjectId id)
         {
-            // ВАЖНО: GetPoint3dAt возвращает координаты в WCS,
-            // а GetPoint2dAt — в OCS полилинии. Ячейки сетки строятся в WCS,
-            // поэтому смешивать системы нельзя — иначе клиппинг даёт мусор.
-            var pts = new List<Point2d>(pl.NumberOfVertices);
-            for (int i = 0; i < pl.NumberOfVertices; i++)
-            {
-                var p3 = pl.GetPoint3dAt(i);
-                pts.Add(new Point2d(p3.X, p3.Y));
-            }
+            if (id.IsNull) return null;
+            var obj = trans.GetObject(id, OpenMode.ForRead);
 
-            // Нормализуем направление обхода в CCW —
-            // алгоритм Сазерленда–Ходжмана работает только с CCW-полигонами
+            // Опорные вершины (3D, лежат НА кривой) — по типу объекта
+            var anchors = new List<Point3d>();
+            Curve? crv = null;
+            switch (obj)
+            {
+                case Polyline pl:
+                    if (!IsClosedCurve(pl)) return null;
+                    crv = pl;
+                    // ВАЖНО: GetPoint3dAt возвращает координаты в WCS,
+                    // а GetPoint2dAt — в OCS полилинии. Ячейки сетки строятся в WCS,
+                    // поэтому смешивать системы нельзя — иначе клиппинг даёт мусор.
+                    for (int i = 0; i < pl.NumberOfVertices; i++)
+                        anchors.Add(pl.GetPoint3dAt(i));
+                    break;
+
+                case Polyline3d p3d:
+                    if (!IsClosedCurve(p3d)) return null;
+                    crv = p3d;
+                    foreach (ObjectId vId in p3d)
+                    {
+                        var v = trans.GetObject(vId, OpenMode.ForRead) as PolylineVertex3d;
+                        if (v != null) anchors.Add(v.Position);
+                    }
+                    break;
+
+                case FeatureLine fl:
+                    if (!IsClosedCurve(fl)) return null;
+                    crv = fl;
+                    // Все точки характерной линии (PI + точки отметок) по порядку
+                    var col = fl.GetPoints(Autodesk.Civil.FeatureLinePointType.AllPoints);
+                    foreach (Point3d p in col)
+                        anchors.Add(p);
+                    break;
+
+                default:
+                    return null;
+            }
+            // Дублирующее замыкание и повторы вершин убираем ДО аппроксимации:
+            // пара из двух совпадающих точек (последняя = первая у контура,
+            // замкнутого совпадением концов, или у GetPoints замкнутой
+            // характерной линии) даёт вырожденную хорду длиной во весь контур —
+            // рекурсия обвела бы его второй раз и полигон стал самоналегающим.
+            for (int i = anchors.Count - 1; i > 0; i--)
+                if (anchors[i].DistanceTo(anchors[i - 1]) < 1e-6) anchors.RemoveAt(i);
+            while (anchors.Count > 1 &&
+                   anchors[anchors.Count - 1].DistanceTo(anchors[0]) < 1e-6)
+                anchors.RemoveAt(anchors.Count - 1);
+            if (anchors.Count < 3) return null;
+
+            // Дуговые сегменты (скругления характерных линий, бульжи полилиний)
+            // аппроксимируем адаптивно: между опорными вершинами вставляем точки,
+            // пока стрелка прогиба хорды не станет ≤ 1 см. Прямые участки при
+            // этом не разбиваются (их середина лежит на хорде).
+            var pts = FlattenClosedCurve(crv, anchors);
+
+            // Убираем дублирующее замыкание (последняя точка = первая)
+            // и вырожденные повторы соседних вершин
+            for (int i = pts.Count - 1; i > 0; i--)
+                if (pts[i].GetDistanceTo(pts[i - 1]) < 1e-9) pts.RemoveAt(i);
+            if (pts.Count > 1 && pts[pts.Count - 1].GetDistanceTo(pts[0]) < 1e-9)
+                pts.RemoveAt(pts.Count - 1);
+            if (pts.Count < 3) return null;
+
+            NormalizeCcw(pts);
+            return pts;
+        }
+
+        /// <summary>
+        /// Плановая аппроксимация замкнутой кривой: опорные вершины + адаптивная
+        /// вставка точек на криволинейных участках (рекурсивное деление пополам
+        /// по длине дуги, критерий — стрелка прогиба хорды ≤ SagTol). Если API
+        /// кривой отказывает (например, вершина спайн-полилинии не на кривой) —
+        /// тихий фолбэк на прежнее поведение: хорды по опорным вершинам.
+        /// </summary>
+        private static List<Point2d> FlattenClosedCurve(Curve crv, List<Point3d> anchors)
+        {
+            const double SagTol   = 0.01;  // 1 см — максимальное отклонение хорды
+            const int    MaxDepth = 10;    // ≤ 2^10 точек на сегмент (страховка)
+
+            var plain = new List<Point2d>(anchors.Count);
+            foreach (var a in anchors) plain.Add(new Point2d(a.X, a.Y));
+
+            try
+            {
+                double totalLen = crv.GetDistanceAtParameter(crv.EndParam);
+                if (totalLen <= 1e-9) return plain;
+
+                var dists = new double[anchors.Count];
+                for (int i = 0; i < anchors.Count; i++)
+                    dists[i] = crv.GetDistAtPoint(anchors[i]);
+
+                var outPts = new List<Point2d>();
+
+                void Subdivide(double dA, Point2d pA, double dB, Point2d pB, int depth)
+                {
+                    if (depth >= MaxDepth || dB - dA <= 1e-6) return;
+                    // Вырожденная хорда (pA≈pB): стрелку прогиба не измерить,
+                    // деление ушло бы в полный обход контура — не делим.
+                    if (pA.GetDistanceTo(pB) < 1e-6) return;
+                    double dM = (dA + dB) / 2.0;
+                    double dq = dM > totalLen ? dM - totalLen : dM;   // замыкающий сегмент
+                    var m3 = crv.GetPointAtDist(dq);
+                    var pM = new Point2d(m3.X, m3.Y);
+                    if (DistPointToSegment(pM, pA, pB) <= SagTol) return;   // прямая
+                    Subdivide(dA, pA, dM, pM, depth + 1);
+                    outPts.Add(pM);
+                    Subdivide(dM, pM, dB, pB, depth + 1);
+                }
+
+                for (int i = 0; i < anchors.Count; i++)
+                {
+                    int j = (i + 1) % anchors.Count;
+                    double dA = dists[i], dB = dists[j];
+                    if (j == 0 && dB <= dA + 1e-9) dB += totalLen;  // переход через шов
+                    outPts.Add(plain[i]);
+                    if (dB > dA + 1e-9)
+                        Subdivide(dA, plain[i], dB, plain[j], 0);
+                }
+                return outPts;
+            }
+            catch
+            {
+                return plain;   // фолбэк: хорды по опорным вершинам (как раньше)
+            }
+        }
+
+        /// <summary>Расстояние от точки до отрезка AB (в плане).</summary>
+        internal static double DistPointToSegment(Point2d p, Point2d a, Point2d b)
+        {
+            double abx = b.X - a.X, aby = b.Y - a.Y;
+            double len2 = abx * abx + aby * aby;
+            if (len2 < 1e-18) return p.GetDistanceTo(a);
+            double t = ((p.X - a.X) * abx + (p.Y - a.Y) * aby) / len2;
+            t = t < 0 ? 0 : (t > 1 ? 1 : t);
+            double qx = a.X + t * abx, qy = a.Y + t * aby;
+            double dx = p.X - qx, dy = p.Y - qy;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        /// <summary>Замкнута ли кривая: флаг Closed либо конец совпал с началом.</summary>
+        private static bool IsClosedCurve(Curve c)
+        {
+            if (c.Closed) return true;
+            try { return c.StartPoint.DistanceTo(c.EndPoint) <= 1e-4; }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Нормализует направление обхода кольца в CCW —
+        /// алгоритм Сазерленда–Ходжмана работает только с CCW-полигонами.
+        /// </summary>
+        private static void NormalizeCcw(List<Point2d> pts)
+        {
             double area = 0;
             int n = pts.Count;
             for (int i = 0; i < n; i++)
@@ -2446,7 +2814,6 @@ namespace KartogrammaPlugin
             }
             // Положительная "shoelace area по часовой" => CW => реверсим
             if (area > 0) pts.Reverse();
-            return pts;
         }
 
         /// <summary>Точка внутри полигона — ray-casting</summary>
@@ -2488,6 +2855,11 @@ namespace KartogrammaPlugin
         {
             if (_boundaryPts == null && _innerPtsList == null)
                 return true;
+
+            // Быстрый отсев: точка вне габаритов наружной границы — точно снаружи
+            if (_boundaryPts != null &&
+                (wx < _bndMinX || wx > _bndMaxX || wy < _bndMinY || wy > _bndMaxY))
+                return false;
 
             var pt = new Point2d(wx, wy);
 

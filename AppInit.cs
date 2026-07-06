@@ -225,20 +225,23 @@ namespace KartogrammaPlugin
 
                         case PickRequest.OuterBoundary:
                             var peo = new PromptEntityOptions(
-                                "\nВыберите замкнутую полилинию наружной границы: ");
-                            peo.SetRejectMessage("\nОбъект должен быть полилинией.");
+                                "\nВыберите замкнутый контур наружной границы " +
+                                "(полилиния / 3D-полилиния / характерная линия): ");
+                            peo.SetRejectMessage(
+                                "\nОбъект должен быть полилинией, 3D-полилинией или характерной линией.");
                             peo.AddAllowedClass(typeof(Autodesk.AutoCAD.DatabaseServices.Polyline), true);
+                            peo.AddAllowedClass(typeof(Autodesk.AutoCAD.DatabaseServices.Polyline3d), true);
+                            peo.AddAllowedClass(typeof(Autodesk.Civil.DatabaseServices.FeatureLine), true);
                             var per = ed.GetEntity(peo);
                             if (per.Status == PromptStatus.OK)
                             {
                                 using var tr = doc.Database.TransactionManager.StartTransaction();
-                                var pl = tr.GetObject(per.ObjectId,
-                                    Autodesk.AutoCAD.DatabaseServices.OpenMode.ForRead)
-                                    as Autodesk.AutoCAD.DatabaseServices.Polyline;
-                                if (pl != null && pl.Closed)
+                                // Единая проверка с расчётом: контур валиден, если из него
+                                // извлекается замкнутое кольцо (флаг Closed или совпадение концов)
+                                if (KartogrammaProcessor.GetBoundaryPoints(tr, per.ObjectId) != null)
                                     pickedOuterBoundary = per.ObjectId;
                                 else
-                                    ed.WriteMessage("\nВыбранная полилиния не замкнута.");
+                                    ed.WriteMessage("\nВыбранный контур не замкнут.");
                                 tr.Commit();
                             }
                             continue;
@@ -284,30 +287,31 @@ namespace KartogrammaPlugin
                         case PickRequest.InnerBoundaries:
                             {
                                 var collected = new System.Collections.Generic.List<Autodesk.AutoCAD.DatabaseServices.ObjectId>();
-                                ed.WriteMessage("\nВыберите замкнутые полилинии внутренних границ (ENTER — закончить).");
+                                ed.WriteMessage("\nВыберите замкнутые контуры внутренних границ — " +
+                                    "полилинии / 3D-полилинии / характерные линии (ENTER — закончить).");
                                 while (true)
                                 {
                                     var pei = new PromptEntityOptions(
                                         $"\nВнутренняя граница #{collected.Count + 1} (ENTER — готово): ");
-                                    pei.SetRejectMessage("\nОбъект должен быть полилинией.");
+                                    pei.SetRejectMessage(
+                                        "\nОбъект должен быть полилинией, 3D-полилинией или характерной линией.");
                                     pei.AddAllowedClass(typeof(Autodesk.AutoCAD.DatabaseServices.Polyline), true);
+                                    pei.AddAllowedClass(typeof(Autodesk.AutoCAD.DatabaseServices.Polyline3d), true);
+                                    pei.AddAllowedClass(typeof(Autodesk.Civil.DatabaseServices.FeatureLine), true);
                                     pei.AllowNone = true;
                                     var peri = ed.GetEntity(pei);
                                     if (peri.Status != PromptStatus.OK) break;
                                     using var tri = doc.Database.TransactionManager.StartTransaction();
-                                    var pli = tri.GetObject(peri.ObjectId,
-                                        Autodesk.AutoCAD.DatabaseServices.OpenMode.ForRead)
-                                        as Autodesk.AutoCAD.DatabaseServices.Polyline;
-                                    if (pli != null && pli.Closed)
+                                    if (KartogrammaProcessor.GetBoundaryPoints(tri, peri.ObjectId) != null)
                                     {
                                         if (!collected.Contains(peri.ObjectId))
                                             collected.Add(peri.ObjectId);
                                         else
-                                            ed.WriteMessage("\nЭта полилиния уже добавлена.");
+                                            ed.WriteMessage("\nЭтот контур уже добавлен.");
                                     }
                                     else
                                     {
-                                        ed.WriteMessage("\nВыбранная полилиния не замкнута.");
+                                        ed.WriteMessage("\nВыбранный контур не замкнут.");
                                     }
                                     tri.Commit();
                                 }
@@ -341,16 +345,40 @@ namespace KartogrammaPlugin
                             }
                             continue;
 
+                        case PickRequest.ManualTriple:
+                            {
+                                var opts = mainForm.CollectOptionsPublic();
+                                var proc = new KartogrammaProcessor(doc, opts);
+                                ed.WriteMessage(
+                                    "\nТройка отметок: укажите точку в зоне перекрытия поверхностей (ENTER — выход).");
+                                while (true)
+                                {
+                                    var pot = new PromptPointOptions(
+                                        "\nТочка для тройки отметок (ENTER — выход): ")
+                                    { AllowNone = true };
+                                    var prt = ed.GetPoint(pot);
+                                    if (prt.Status != PromptStatus.OK) break;
+
+                                    bool ok;
+                                    using (doc.LockDocument())
+                                        ok = proc.DrawManualTriple(prt.Value);
+                                    if (!ok)
+                                        ed.WriteMessage(
+                                            "\n[Картограмма] В этой точке нет обеих поверхностей — тройка не проставлена.");
+                                }
+                            }
+                            continue;
+
                         case PickRequest.CalloutLabel:
                             {
                                 var opts = mainForm.CollectOptionsPublic();
-                                ed.WriteMessage("\nВыноска отметок: нажмите на любую цифру тройки (ENTER — выход).");
+                                ed.WriteMessage("\nВыноска отметок: нажмите на любую цифру тройки отметок (ENTER — выход).");
                                 var proc = new KartogrammaProcessor(doc, opts);
                                 while (true)
                                 {
                                     // Шаг 1: пользователь кликает на любую цифру тройки
                                     var po1 = new PromptPointOptions(
-                                        "\nНажмите на любую цифру тройки (ENTER — выход): ")
+                                        "\nНажмите на любую цифру тройки отметок (ENTER — выход): ")
                                     { AllowNone = true };
                                     var pr1 = ed.GetPoint(po1);
                                     if (pr1.Status != PromptStatus.OK) break;

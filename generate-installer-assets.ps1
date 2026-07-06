@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 #  Генерация графики для установщика (Inno Setup)
 #  Выходные файлы:  dist\assets\wizard_side.png  (164x314)
 #                   dist\assets\wizard_small.png  (55x55)
@@ -12,7 +12,13 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 Add-Type -AssemblyName System.Drawing
 
-$drawingRef = [System.Drawing.Bitmap].Assembly.Location
+# В PowerShell 7+ типы System.Drawing разнесены по сборкам:
+# Bitmap/Graphics — System.Drawing.Common, PointF/Rectangle —
+# System.Drawing.Primitives. Для компиляции Add-Type нужны обе
+# (плюс базовые runtime-сборки).
+$drawingRef = @([System.Drawing.Bitmap].Assembly.Location)
+$primitives = [System.Drawing.PointF].Assembly.Location
+if ($primitives -notin $drawingRef) { $drawingRef += $primitives }
 
 Add-Type -ReferencedAssemblies $drawingRef -TypeDefinition @'
 using System;

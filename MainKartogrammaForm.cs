@@ -10,7 +10,7 @@ using AcApp = Autodesk.AutoCAD.ApplicationServices.Application;
 namespace KartogrammaPlugin
 {
     /// <summary>Тип запроса на выбор точек в чертеже (pick)</summary>
-    public enum PickRequest { None, BasePoint, Angle, OuterBoundary, InnerBoundaries, CopyKartogramma, SizeX, SizeY, CalloutLabel }
+    public enum PickRequest { None, BasePoint, Angle, OuterBoundary, InnerBoundaries, CopyKartogramma, SizeX, SizeY, CalloutLabel, ManualTriple }
 
     /// <summary>Главный диалог «Картограмма земляных работ» — плоский двухколоночный макет</summary>
     public sealed class MainKartogrammaForm : Form
@@ -326,7 +326,8 @@ namespace KartogrammaPlugin
             btnClearOuter.Click += OnClearOuterBound;
             grpBnd.Controls.Add(btnClearOuter);
             btnOuterBound = new Button { Text = ">>", Location = new Point(S(324), S(21)), Size = new Size(S(32), S(22)), Enabled = false };
-            new ToolTip().SetToolTip(btnOuterBound, "Выбрать замкнутую полилинию наружной границы на чертеже");
+            new ToolTip().SetToolTip(btnOuterBound,
+                "Выбрать замкнутый контур наружной границы на чертеже\n(полилиния, 3D-полилиния или характерная линия)");
             btnOuterBound.Click += OnPickOuterBound;
             grpBnd.Controls.Add(btnOuterBound);
             lblInnerBound = new Label
@@ -343,7 +344,8 @@ namespace KartogrammaPlugin
             btnClearInner.Click += OnClearInnerBound;
             grpBnd.Controls.Add(btnClearInner);
             btnInnerBound = new Button { Text = ">>", Location = new Point(S(324), S(47)), Size = new Size(S(32), S(22)), Enabled = false };
-            new ToolTip().SetToolTip(btnInnerBound, "Выбрать замкнутые полилинии внутренних границ (дырок) на чертеже");
+            new ToolTip().SetToolTip(btnInnerBound,
+                "Выбрать замкнутые контуры внутренних границ (дырок) на чертеже\n(полилинии, 3D-полилинии или характерные линии)");
             btnInnerBound.Click += OnPickInnerBounds;
             grpBnd.Controls.Add(btnInnerBound);
             Controls.Add(grpBnd);
@@ -450,6 +452,32 @@ namespace KartogrammaPlugin
                 Size     = new Size(S(160), S(18))
             };
             grpL.Controls.Add(chkHide);
+
+            // Кнопка «проставить тройку отметок в точке» — маленькое обрезанное
+            // перекрестье (как узел сетки) в правом нижнем углу раздела
+            var btnManualTriple = new Button
+            {
+                Text     = "",
+                Location = new Point(rw - S(32), grpLabelsH - S(28)),
+                Size     = new Size(S(24), S(22))
+            };
+            btnManualTriple.Paint += (s, pe) =>
+            {
+                var b = (Button)s!;
+                var g = pe.Graphics;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                int cx = b.ClientSize.Width / 2, cy = b.ClientSize.Height / 2;
+                int arm = S(6), gap = S(2);
+                using var pen = new Pen(b.Enabled ? b.ForeColor : SystemColors.GrayText, S(1) * 1.4f);
+                g.DrawLine(pen, cx - arm, cy, cx - gap, cy);   // перекрестье с разрывом
+                g.DrawLine(pen, cx + gap, cy, cx + arm, cy);   // в центре — как узел
+                g.DrawLine(pen, cx, cy - arm, cx, cy - gap);   // сетки картограммы
+                g.DrawLine(pen, cx, cy + gap, cx, cy + arm);
+            };
+            new ToolTip().SetToolTip(btnManualTriple,
+                "Проставить тройку отметок в указанной точке чертежа\n(между выбранными поверхностями)");
+            btnManualTriple.Click += OnPickManualTriple;
+            grpL.Controls.Add(btnManualTriple);
 
             Controls.Add(grpL);
 
@@ -800,6 +828,16 @@ namespace KartogrammaPlugin
         private void OnPickCalloutLabel(object? sender, EventArgs e)
         {
             PendingPick  = PickRequest.CalloutLabel;
+            SaveSession();
+            DialogResult = DialogResult.Retry;
+        }
+
+        // ── «Тройка отметок в точке»: сворачиваем диалог, AppInit запрашивает
+        //    точки в чертеже и рисует тройки через KartogrammaProcessor ──────────
+        private void OnPickManualTriple(object? sender, EventArgs e)
+        {
+            if (!ValidateSurfaces()) return;   // тройке нужны обе поверхности
+            PendingPick  = PickRequest.ManualTriple;
             SaveSession();
             DialogResult = DialogResult.Retry;
         }

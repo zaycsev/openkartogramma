@@ -45,13 +45,23 @@
 
   <!--
     ═══════════════════════════════════════════════════════════════
-     ПУТИ К DLL — автоопределение установленной версии AutoCAD
-     MSBuild выберет первый существующий путь.
-     Порядок приоритета: 2026 → 2025 → 2024 → … → 2015
+     ПУТИ К DLL — автоопределение установленной версии AutoCAD,
+     ОТДЕЛЬНО для каждой линейки (перебор годов, как раньше):
+       net48          ← Civil 3D 2015-2024 (DLL под .NET Framework)
+       net8.0-windows ← Civil 3D 2025-2026 (DLL под .NET 8)
+     Смешивать линейки нельзя: net48 против DLL 2025+ даёт CS1705.
+     Год засчитывается, только если есть и AutoCAD (acdbmgd), и
+     Civil 3D (AeccDbMgd) — обычный AutoCAD без Civil не подходит.
+
+     Если своей линейки на ПК нет — фолбэк на референсные DLL из
+     libs\acad-refs (лежат в проекте, интернет НЕ нужен). Поэтому
+     сборка на ЛЮБОЙ машине всегда даёт обе DLL, и установщик всегда
+     поддерживает Civil 3D 2015-2024 и 2025+ одновременно. Версия
+     референсных DLL не ограничивает совместимость: сборки AutoCAD не
+     strong-named, .NET биндит их по имени, без проверки версии.
     ═══════════════════════════════════════════════════════════════
   -->
   <PropertyGroup>
-    <AcadPath2027>C:\Program Files\Autodesk\AutoCAD 2027</AcadPath2027>
     <AcadPath2026>C:\Program Files\Autodesk\AutoCAD 2026</AcadPath2026>
     <AcadPath2025>C:\Program Files\Autodesk\AutoCAD 2025</AcadPath2025>
     <AcadPath2024>C:\Program Files\Autodesk\AutoCAD 2024</AcadPath2024>
@@ -65,40 +75,47 @@
     <AcadPath2016>C:\Program Files\Autodesk\AutoCAD 2016</AcadPath2016>
     <AcadPath2015>C:\Program Files\Autodesk\AutoCAD 2015</AcadPath2015>
 
-    <!-- Автоопределение: берём первую установленную версию -->
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2027)\acdbmgd.dll')">$(AcadPath2027)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2026)\acdbmgd.dll')">$(AcadPath2026)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2025)\acdbmgd.dll')">$(AcadPath2025)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2024)\acdbmgd.dll')">$(AcadPath2024)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2023)\acdbmgd.dll')">$(AcadPath2023)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2022)\acdbmgd.dll')">$(AcadPath2022)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2021)\acdbmgd.dll')">$(AcadPath2021)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2020)\acdbmgd.dll')">$(AcadPath2020)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2019)\acdbmgd.dll')">$(AcadPath2019)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2018)\acdbmgd.dll')">$(AcadPath2018)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2017)\acdbmgd.dll')">$(AcadPath2017)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2016)\acdbmgd.dll')">$(AcadPath2016)</AcadPathResolved>
-    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND Exists('$(AcadPath2015)\acdbmgd.dll')">$(AcadPath2015)</AcadPathResolved>
+    <!-- Линейка .NET 8 (2026 → 2025): AutoCAD + Civil 3D обязательны -->
+    <AcadPathNet8 Condition="'$(AcadPathNet8)' == '' AND Exists('$(AcadPath2026)\acdbmgd.dll') AND (Exists('$(AcadPath2026)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2026)\AeccDbMgd.dll'))">$(AcadPath2026)</AcadPathNet8>
+    <AcadPathNet8 Condition="'$(AcadPathNet8)' == '' AND Exists('$(AcadPath2025)\acdbmgd.dll') AND (Exists('$(AcadPath2025)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2025)\AeccDbMgd.dll'))">$(AcadPath2025)</AcadPathNet8>
+    <!-- Нет установленного Civil 3D 2025+ → референсные DLL из проекта -->
+    <AcadPathNet8 Condition="'$(AcadPathNet8)' == '' AND Exists('$(MSBuildProjectDirectory)\libs\acad-refs\net8\acdbmgd.dll')">$(MSBuildProjectDirectory)\libs\acad-refs\net8</AcadPathNet8>
 
-    <!-- Civil 3D DLL: в подпапке C3D (2021+) или в корне AutoCAD (2015-2020) -->
-    <C3DPathResolved Condition="Exists('$(AcadPathResolved)\C3D\AeccDbMgd.dll')">$(AcadPathResolved)\C3D</C3DPathResolved>
-    <C3DPathResolved Condition="'$(C3DPathResolved)' == '' AND Exists('$(AcadPathResolved)\AeccDbMgd.dll')">$(AcadPathResolved)</C3DPathResolved>
+    <!-- Линейка .NET Framework (2024 → … → 2015): AutoCAD + Civil 3D обязательны -->
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2024)\acdbmgd.dll') AND (Exists('$(AcadPath2024)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2024)\AeccDbMgd.dll'))">$(AcadPath2024)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2023)\acdbmgd.dll') AND (Exists('$(AcadPath2023)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2023)\AeccDbMgd.dll'))">$(AcadPath2023)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2022)\acdbmgd.dll') AND (Exists('$(AcadPath2022)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2022)\AeccDbMgd.dll'))">$(AcadPath2022)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2021)\acdbmgd.dll') AND (Exists('$(AcadPath2021)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2021)\AeccDbMgd.dll'))">$(AcadPath2021)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2020)\acdbmgd.dll') AND (Exists('$(AcadPath2020)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2020)\AeccDbMgd.dll'))">$(AcadPath2020)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2019)\acdbmgd.dll') AND (Exists('$(AcadPath2019)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2019)\AeccDbMgd.dll'))">$(AcadPath2019)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2018)\acdbmgd.dll') AND (Exists('$(AcadPath2018)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2018)\AeccDbMgd.dll'))">$(AcadPath2018)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2017)\acdbmgd.dll') AND (Exists('$(AcadPath2017)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2017)\AeccDbMgd.dll'))">$(AcadPath2017)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2016)\acdbmgd.dll') AND (Exists('$(AcadPath2016)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2016)\AeccDbMgd.dll'))">$(AcadPath2016)</AcadPathNetFx>
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(AcadPath2015)\acdbmgd.dll') AND (Exists('$(AcadPath2015)\C3D\AeccDbMgd.dll') OR Exists('$(AcadPath2015)\AeccDbMgd.dll'))">$(AcadPath2015)</AcadPathNetFx>
+    <!-- Нет установленного Civil 3D 2015-2024 → референсные DLL из проекта -->
+    <AcadPathNetFx Condition="'$(AcadPathNetFx)' == '' AND Exists('$(MSBuildProjectDirectory)\libs\acad-refs\net48\acdbmgd.dll')">$(MSBuildProjectDirectory)\libs\acad-refs\net48</AcadPathNetFx>
 
-    <!-- AEC base DLL: в подпапке ACA (2026+) или в корне AutoCAD (более ранние) -->
-    <AecBasePathResolved Condition="Exists('$(AcadPathResolved)\ACA\AecBaseMgd.dll')">$(AcadPathResolved)\ACA</AecBasePathResolved>
-    <AecBasePathResolved Condition="'$(AecBasePathResolved)' == '' AND Exists('$(AcadPathResolved)\AecBaseMgd.dll')">$(AcadPathResolved)</AecBasePathResolved>
+    <!-- Путь для ТЕКУЩЕГО собираемого таргета -->
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND '$(TargetFramework)' == 'net48'">$(AcadPathNetFx)</AcadPathResolved>
+    <AcadPathResolved Condition="'$(AcadPathResolved)' == '' AND '$(TargetFramework)' == 'net8.0-windows'">$(AcadPathNet8)</AcadPathResolved>
+
+    <!-- Civil 3D DLL: подпапка C3D (2021+), корень AutoCAD (2015-2020) или libs -->
+    <C3DPathResolved Condition="'$(AcadPathResolved)' != '' AND Exists('$(AcadPathResolved)\C3D\AeccDbMgd.dll')">$(AcadPathResolved)\C3D</C3DPathResolved>
+    <C3DPathResolved Condition="'$(C3DPathResolved)' == '' AND '$(AcadPathResolved)' != '' AND Exists('$(AcadPathResolved)\AeccDbMgd.dll')">$(AcadPathResolved)</C3DPathResolved>
+
+    <!-- AEC base DLL: подпапка ACA (2026+), корень (ранние версии) или libs -->
+    <AecBasePathResolved Condition="'$(AcadPathResolved)' != '' AND Exists('$(AcadPathResolved)\ACA\AecBaseMgd.dll')">$(AcadPathResolved)\ACA</AecBasePathResolved>
+    <AecBasePathResolved Condition="'$(AecBasePathResolved)' == '' AND '$(AcadPathResolved)' != '' AND Exists('$(AcadPathResolved)\AecBaseMgd.dll')">$(AcadPathResolved)</AecBasePathResolved>
 
     <!-- Куда автодеплой кладёт DLL (внутри бандла) -->
     <BundleBase>$(APPDATA)\Autodesk\ApplicationPlugins\KartogrammaPlugin.bundle\Contents</BundleBase>
   </PropertyGroup>
 
-  <!-- ── Единый набор зависимостей для всех TFM ────────────────────────── -->
   <!--
-    Используем DLL из найденной версии AutoCAD.
-    Private=false: DLL не копируются — AutoCAD предоставит свои при загрузке.
-    API acdbmgd/acmgd/accoremgd/AecBaseMgd/AeccDbMgd стабилен между 2015-2026,
-    поэтому DLL, скомпилированная по любой версии, работает на всех остальных
-    благодаря assembly binding redirect, встроенному в AutoCAD.
+    Private=false: DLL не копируются в output — AutoCAD предоставит свои
+    при загрузке плагина. API acdbmgd/acmgd/accoremgd/AecBaseMgd/AeccDbMgd
+    стабилен внутри линейки, поэтому DLL, собранная по любой версии своей
+    линейки, работает на всех остальных её версиях.
   -->
   <ItemGroup Condition="'$(AcadPathResolved)' != ''">
     <Reference Include="acdbmgd">

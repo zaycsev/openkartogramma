@@ -18,36 +18,33 @@ if (-not $InnoSetup -or -not (Test-Path $InnoSetup)) {
     $InnoSetup = $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 
-# --- Auto-detect an AutoCAD/Civil 3D install that has the Civil DLLs (AeccDbMgd) ---
-# Авто-определение в .csproj берёт старшую версию AutoCAD, но обычный AutoCAD
-# (без Civil 3D) не содержит AeccDbMgd/AecBaseMgd. Здесь ищем версию с Civil 3D.
-if (-not $AcadPath) {
-    $acadVersions = 2027..2015 | ForEach-Object { "C:\Program Files\Autodesk\AutoCAD $_" }
-    $AcadPath = $acadVersions | Where-Object {
-        (Test-Path "$_\acdbmgd.dll") -and
-        ((Test-Path "$_\C3D\AeccDbMgd.dll") -or (Test-Path "$_\AeccDbMgd.dll"))
-    } | Select-Object -First 1
-}
-$acadProp = @()
-if ($AcadPath) { $acadProp = @("-p:AcadPathResolved=$AcadPath") }
+# --- AutoCAD/Civil 3D DLLs для сборки ---
+# .csproj сам находит DLL отдельно для каждой линейки:
+#   net48 ← установленный Civil 3D 2015-2024, иначе libs\acad-refs\net48
+#   net8  ← установленный Civil 3D 2025+,    иначе libs\acad-refs\net8
+# Референсные DLL лежат в проекте — интернет и установленный AutoCAD для
+# сборки не нужны. Оба таргета собираются на любой машине, поэтому
+# установщик ВСЕГДА поддерживает Civil 3D 2015-2024 (net48) и 2025+
+# включая будущие версии (net8, в PackageContents.xml без верхней границы).
 
 function Step { Write-Host "`n> $args" -ForegroundColor Cyan  }
 function Ok   { Write-Host "  OK: $args" -ForegroundColor Green }
 function Fail { Write-Host "  FAIL: $args" -ForegroundColor Red; exit 1 }
 function Info { Write-Host "  ..: $args" -ForegroundColor Gray  }
 
-if ($AcadPath) { Info "AutoCAD (Civil 3D) DLLs from: $AcadPath" } else { Info "AutoCAD path auto-resolved by MSBuild" }
+Info "AutoCAD/Civil 3D DLLs resolved per-target by .csproj (local install or libs\acad-refs)"
 
 # Step 1: build net8
 Step "Build net8.0-windows..."
-dotnet build "$root\KartogrammaPlugin.csproj" -c $Config -f net8.0-windows --nologo @acadProp
+dotnet build "$root\KartogrammaPlugin.csproj" -c $Config -f net8.0-windows --nologo
 if ($LASTEXITCODE -ne 0) { Fail "net8 build failed" }
 Ok "net8.0-windows done"
 
 # Step 2: build net48
 Step "Build net48..."
-dotnet build "$root\KartogrammaPlugin.csproj" -c $Config -f net48 --nologo @acadProp 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { Ok "net48 done" } else { Info "net48 skipped (no Civil 3D DLLs)" }
+dotnet build "$root\KartogrammaPlugin.csproj" -c $Config -f net48 --nologo
+if ($LASTEXITCODE -ne 0) { Fail "net48 build failed" }
+Ok "net48 done"
 
 # Step 3: assemble dist\bundle
 Step "Assembling dist\bundle..."

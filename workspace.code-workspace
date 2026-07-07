@@ -1,4 +1,6 @@
 {
-	"folders": [],
+	"folders": [
+		{ "path": "." }
+	],
 	"settings": {}
 }

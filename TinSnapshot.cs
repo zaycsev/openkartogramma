@@ -44,7 +44,12 @@ namespace KartogrammaPlugin
         /// <summary>Построить снимок TIN-поверхности. null — нет треугольников.</summary>
         public static TinSnapshot? Build(TinSurface tin)
         {
-            var tris = tin.Triangles;
+            // ВАЖНО: только видимые треугольники (includeInvisibleTriangle=false).
+            // Невидимые — скрытые границами поверхности (outer/hide boundary):
+            // FindElevationAtXY на них кидает «нет поверхности», и снимок обязан
+            // вести себя так же, иначе у кромок появляются фантомные отметки
+            // и объёмы (свойство Triangles вернуло бы ВСЕ треугольники).
+            var tris = tin.GetTriangles(false);
             int n = tris.Count;
             if (n == 0) return null;
 

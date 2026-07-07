@@ -95,33 +95,12 @@ if (-not $Civil3D -or -not (Test-Path $Civil3D)) {
 }
 
 # -- Путь к AutoCAD для КОМПИЛЯЦИИ ────────────────────────────────────────────
-#  Авто-выбор в .csproj берёт старшую версию AutoCAD, но обычный AutoCAD без
-#  Civil 3D не содержит AeccDbMgd, а его accoremgd может быть .NET 8 (CS1705 при
-#  сборке net48). Поэтому для сборки явно выбираем папку с Civil 3D DLL.
-$buildAcadPath = ""
-function Test-HasC3D($dir) {
-    return (Test-Path (Join-Path $dir 'C3D\AeccDbMgd.dll')) -or `
-           (Test-Path (Join-Path $dir 'AeccDbMgd.dll'))
-}
-if ($found -and $found.Count -gt 0) {
-    $bestBuild = $found |
-        Where-Object { $_.HasC3D } |
-        Sort-Object @{Expression='Year';Descending=$true} |
-        Select-Object -First 1
-    if ($bestBuild) { $buildAcadPath = $bestBuild.Dir }
-}
-if (-not $buildAcadPath -and $Civil3D) {
-    $cand = Split-Path $Civil3D -Parent
-    if (Test-HasC3D $cand) { $buildAcadPath = $cand }
-}
-
-$buildProps = @()
-if ($buildAcadPath) {
-    $buildProps = @("-p:AcadPathResolved=$buildAcadPath")
-    Info "Build DLLs from: $buildAcadPath"
-} else {
-    Info "No Civil 3D DLLs found - MSBuild will auto-resolve (may fail)"
-}
+#  Больше НЕ передаём -p:AcadPathResolved: .csproj сам находит DLL отдельно
+#  для каждой линейки (net48 ← Civil 3D 2015-2024, net8 ← 2025+), а если
+#  нужной линейки на ПК нет — берёт референсные DLL из libs\acad-refs
+#  (лежат в проекте, интернет не нужен). Навязывать один путь обоим
+#  таргетам нельзя: net48 против DLL 2025+ падает с CS1705.
+Info "AutoCAD/Civil 3D DLLs resolved per-target by .csproj (local install or libs\acad-refs)"
 
 # -- 2. Close Civil 3D (ДО сборки!) ------------------------------------------
 #  Civil 3D держит загруженную DLL заблокированной — если собирать при
@@ -154,7 +133,7 @@ $t = [Diagnostics.Stopwatch]::StartNew()
 
 dotnet build "$root\KartogrammaPlugin.csproj" `
     -c Debug `
-    --nologo -v minimal @buildProps
+    --nologo -v minimal
 
 $t.Stop()
 if ($LASTEXITCODE -ne 0) {

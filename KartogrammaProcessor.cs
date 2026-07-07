@@ -99,6 +99,12 @@ namespace KartogrammaPlugin
                 EraseByLayer(trans, _ms, _o.GridLayerName);
                 int drawn = DrawGridLines(trans, rows, cols, cosA, sinA, surf1!, surf2!);
 
+                // Зоны резких перепадов (зумпф и т.п.) — рамки на слое сетки
+                DetectAnomalyZones(surf1!, surf2!, rows, cols, cosA, sinA);
+                if (_anomalyZones != null)
+                    foreach (var z in _anomalyZones)
+                        DrawZoneRect(trans, z, cosA, sinA);
+
                 trans.Commit();
 
                 ed.WriteMessage($"\n[Картограмма] Сетка построена: {drawn} из {cols * rows} ячеек (в зоне перекрытия поверхностей)\n");
@@ -143,6 +149,11 @@ namespace KartogrammaPlugin
                 double angle = _o.RotationRadians;
                 double cosA  = Math.Cos(angle), sinA = Math.Sin(angle);
                 double area  = _o.CellSizeX * _o.CellSizeY;
+
+                // Зоны резких перепадов (зумпф и т.п.) ищем ДО расчёта объёмов:
+                // их объём исключается из обычных ячеек и считается отдельно.
+                Report("Анализ резких перепадов…", 8);
+                DetectAnomalyZones(surf1!, surf2!, rows, cols, cosA, sinA);
 
                 EnsureLayer(trans, _o.TextLayerName,   7);
                 EnsureLayer(trans, _o.WorkLayerName,   _o.ColorWork);
@@ -252,6 +263,14 @@ namespace KartogrammaPlugin
                         10 + (int)(80.0 * end / totalCells));
                 }
 
+                // Отладка распределения: KARTOGRAMMA_DEBUG=1 → объём и площадь
+                // каждой ячейки в командную строку (для сверки версий по ячейкам)
+                if (Environment.GetEnvironmentVariable("KARTOGRAMMA_DEBUG") == "1")
+                    for (int ci = 0; ci < totalCells; ci++)
+                        ed.WriteMessage(
+                            $"\n[Отладка] Ячейка строка {dataCells[ci].Row + 1}, колонка {dataCells[ci].Col + 1}: " +
+                            $"V={volRes[ci]:F3} м³, S={areaRes[ci]:F2} м²");
+
                 // ── Фаза 2: подписи и итоги (последовательно — работа с чертежом) ──
                 double totalArea = 0;
                 for (int ci = 0; ci < totalCells; ci++)
@@ -302,6 +321,44 @@ namespace KartogrammaPlugin
                         System.Globalization.CultureInfo.InvariantCulture);
                     if (isCut) { totCut  += dispVol; colCut[c]  += dispVol; rowCut[r]  += dispVol; }
                     else       { totFill += dispVol; colFill[c] += dispVol; rowFill[r] += dispVol; }
+                }
+
+                // ── Зоны резких перепадов: рамка + отдельный объём ────────────────
+                // В итоги таблицы объём зоны относится к строке/колонке ячейки,
+                // в которой лежит её центр — суммы по строкам/колонкам сходятся
+                // с «Всего», а на плане видно раздельно: траншея и зумпф.
+                if (_anomalyZones != null)
+                {
+                    for (int zi = 0; zi < _anomalyZones.Count; zi++)
+                    {
+                        var z = _anomalyZones[zi];
+                        CalcZoneVolume(z, surf1!, surf2!, cosA, sinA,
+                            out double zVol, out double zArea);
+                        totalArea += zArea;
+                        DrawZoneRect(trans, z, cosA, sinA);
+                        ed.WriteMessage(
+                            $"\n[Картограмма] Перепад #{zi + 1}: объём {Signed(zVol, _o.VolumePrecision)} м³, площадь {zArea:F2} м²");
+
+                        if (Math.Abs(zVol) < _o.MinVolume) continue;
+
+                        double zcx = (z.x0 + z.x1) / 2.0, zcy = (z.y0 + z.y1) / 2.0;
+                        FindInsideAnchor(z.x0, z.y0, z.x1 - z.x0, z.y1 - z.y0,
+                            zcx, zcy, cosA, sinA, out double zLx, out double zLy);
+                        AddCenteredText(trans, _o.VolumeLayerName,
+                            LW(zLx, zLy, cosA, sinA),
+                            Signed(zVol, _o.VolumePrecision),
+                            _o.VolumeTextHeight, angle, _o.ColorVolume,
+                            hideMask: _o.HideMaskVolume);
+
+                        double zDisp = double.Parse(
+                            Math.Abs(zVol).ToString("F" + _o.VolumePrecision,
+                                System.Globalization.CultureInfo.InvariantCulture),
+                            System.Globalization.CultureInfo.InvariantCulture);
+                        int zc = Clamp((int)(zcx / _o.CellSizeX), 0, cols - 1);
+                        int zr = Clamp((int)(zcy / _o.CellSizeY), 0, rows - 1);
+                        if (zVol < 0) { totCut  += zDisp; colCut[zc]  += zDisp; rowCut[zr]  += zDisp; }
+                        else          { totFill += zDisp; colFill[zc] += zDisp; rowFill[zr] += zDisp; }
+                    }
                 }
 
                 if (_o.DrawSummaryTable && dataCells.Count > 0)
@@ -396,13 +453,15 @@ namespace KartogrammaPlugin
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  По клику на любую из трёх цифр тройки находит точный узел сетки —
+        //  По клику на любую из трёх цифр тройки находит точный узел —
         //  пересечение, из которого должна стартовать выноска и где должен
         //  стоять разделительный крестик.
-        //  Алгоритм: ищем ближайший MText на одном из трёх слоёв, затем
-        //  все три метки тройки рядом с ним; из позиции рабочей метки (idx=0)
-        //  вычисляем узел по известному смещению (margin, -margin) в локальных
-        //  координатах сетки. Не зависит от BaseX/BaseY/CellSize.
+        //  Алгоритм: берём БЛИЖАЙШИЙ к клику MText одного из трёх слоёв — это
+        //  и есть метка, которую пользователь имеет в виду. Узел вычисляется из
+        //  её позиции по известному смещению её роли (рабочая/проектная/
+        //  существующая) — метки рисовались с точными смещениями от узла,
+        //  поэтому результат однозначен даже в самом густом скоплении троек
+        //  (никакого «поиска в радиусе», где можно зацепить чужую метку).
         // ═══════════════════════════════════════════════════════════════════════
         public Point3d? FindTripletOrigin(Point3d clickedPt)
         {
@@ -428,21 +487,8 @@ namespace KartogrammaPlugin
                 }
                 if (nearestAny == null) { trans.Commit(); return null; }
 
-                // По найденному MText ищем тройку в радиусе 75% ячейки
-                var center = nearestAny.Location;
-                double searchR = Math.Max(_o.CellSizeX, _o.CellSizeY) * 0.75;
-                var found    = new MText?[3];
-                var foundDist = new[] { double.MaxValue, double.MaxValue, double.MaxValue };
-                foreach (ObjectId id in ms)
-                {
-                    var mt = trans.GetObject(id, OpenMode.ForRead) as MText;
-                    if (mt == null) continue;
-                    int idx = Array.IndexOf(layers, mt.Layer);
-                    if (idx < 0) continue;
-                    double d = (mt.Location - center).Length;
-                    if (d > searchR) continue;
-                    if (d < foundDist[idx]) { foundDist[idx] = d; found[idx] = mt; }
-                }
+                int role = Array.IndexOf(layers, nearestAny.Layer);
+                var p    = nearestAny.Location;
                 trans.Commit();
 
                 double cA     = Math.Cos(_o.RotationRadians);
@@ -450,37 +496,16 @@ namespace KartogrammaPlugin
                 double margin = _o.SmallTextHeight * 0.15;
                 double sh     = _o.SmallTextHeight;
 
-                // Рабочая (idx=0): якорь в локальных (nx-margin, ny+margin) от узла
-                // ⇒ узел = рабочая_мир + rotate(+margin, -margin)
-                if (found[0] != null)
-                {
-                    var p = found[0]!.Location;
-                    return new Point3d(
-                        p.X + margin * cA + margin * sA,
-                        p.Y + margin * sA - margin * cA,
-                        clickedPt.Z);
-                }
-                // Проектная (idx=1): якорь в (nx+margin, ny+margin)
-                // ⇒ узел = проектная_мир + rotate(-margin, -margin)
-                if (found[1] != null)
-                {
-                    var p = found[1]!.Location;
-                    return new Point3d(
-                        p.X - margin * cA + margin * sA,
-                        p.Y - margin * sA - margin * cA,
-                        clickedPt.Z);
-                }
-                // Существующая (idx=2): якорь в (nx+margin, ny-margin-sh)
-                // ⇒ узел = существующая_мир + rotate(-margin, +margin+sh)
-                if (found[2] != null)
-                {
-                    var p = found[2]!.Location;
-                    return new Point3d(
-                        p.X - margin * cA - (margin + sh) * sA,
-                        p.Y - margin * sA + (margin + sh) * cA,
-                        clickedPt.Z);
-                }
-                return null;
+                // Обратные смещения «метка → узел» (локальные, поворачиваются):
+                //   рабочая:       якорь (nx−margin, ny+margin)      ⇒ +(margin, −margin)
+                //   проектная:     якорь (nx+margin, ny+margin)      ⇒ +(−margin, −margin)
+                //   существующая:  якорь (nx+margin, ny−margin−sh)   ⇒ +(−margin, margin+sh)
+                double lx = role == 0 ? margin : -margin;
+                double ly = role == 2 ? margin + sh : -margin;
+                return new Point3d(
+                    p.X + lx * cA - ly * sA,
+                    p.Y + lx * sA + ly * cA,
+                    clickedPt.Z);
             }
             catch
             {
@@ -489,11 +514,14 @@ namespace KartogrammaPlugin
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  Выноска тройки отметок. Находит ближайшие MText на слоях «рабочая /
-        //  проектная / существующая» в радиусе половины ячейки от origin,
-        //  переносит их на target, и рисует «+»-маркер в origin для указания,
-        //  откуда вынесена тройка. Маркер ложится на слой рабочей отметки —
-        //  при следующем построении/удалении объёмов исчезнет вместе с ней.
+        //  Выноска тройки отметок. Каждая из трёх меток (рабочая / проектная /
+        //  существующая) находится по её ТОЧНОЙ ожидаемой позиции относительно
+        //  узла origin (метки рисовались с известными смещениями) с допуском в
+        //  долю высоты текста — надёжно даже в самом густом скоплении троек.
+        //  Все три переносятся на target единым смещением (строй сохраняется),
+        //  рисуется линия-выноска, «+»-крестик под тройкой на новом месте и
+        //  малый крестик в исходной точке. Если хоть одна метка не найдена —
+        //  не переносится ничего (тройка ходит только целиком).
         // ═══════════════════════════════════════════════════════════════════════
         public bool CreateLabelCallout(Point3d origin, Point3d target)
         {
@@ -508,18 +536,38 @@ namespace KartogrammaPlugin
                 EnsureLayer(trans, _o.TableLayerName, _o.ColorTable);
 
                 string[] layers = { _o.WorkLayerName, _o.DesignLayerName, _o.ExistLayerName };
+
+                // Метки тройки рисуются с ТОЧНЫМИ смещениями от узла — вычисляем
+                // ожидаемую позицию каждой роли и матчим по ней с малым допуском.
+                // Это однозначно выбирает СВОЮ тройку даже в густом скоплении
+                // (прежний поиск «ближайшей в радиусе полуячейки» цеплял чужую
+                // существующую отметку — она в тройке самая дальняя от узла).
+                double margin = _o.SmallTextHeight * 0.15;
+                double sh     = _o.SmallTextHeight;
+                double cAr    = Math.Cos(_o.RotationRadians);
+                double sAr    = Math.Sin(_o.RotationRadians);
+                Point3d Expected(double lx, double ly) => new Point3d(
+                    origin.X + lx * cAr - ly * sAr,
+                    origin.Y + lx * sAr + ly * cAr,
+                    origin.Z);
+                var expected = new[]
+                {
+                    Expected(-margin,  margin),        // рабочая
+                    Expected( margin,  margin),        // проектная
+                    Expected( margin, -margin - sh),   // существующая
+                };
+                double tol = sh * 0.75;   // допуск — доля высоты текста, не ячейки
+
                 var nearest = new MText?[3];
                 var nearestDist = new[] { double.MaxValue, double.MaxValue, double.MaxValue };
-                double searchR = Math.Max(_o.CellSizeX, _o.CellSizeY) * 0.5;
-
                 foreach (ObjectId id in ms)
                 {
                     var mt = trans.GetObject(id, OpenMode.ForRead) as MText;
                     if (mt == null) continue;
                     int idx = Array.IndexOf(layers, mt.Layer);
                     if (idx < 0) continue;
-                    double d = (mt.Location - origin).Length;
-                    if (d > searchR) continue;
+                    double d = (mt.Location - expected[idx]).Length;
+                    if (d > tol) continue;
                     if (d < nearestDist[idx])
                     {
                         nearestDist[idx] = d;
@@ -529,7 +577,13 @@ namespace KartogrammaPlugin
 
                 if (nearest[0] == null || nearest[1] == null || nearest[2] == null)
                 {
-                    ed.WriteMessage("\n[Картограмма] В указанном месте не найдена полная тройка отметок.");
+                    string[] roleNames = { "рабочая", "проектная (красная)", "существующая (чёрная)" };
+                    var missing = new List<string>();
+                    for (int i = 0; i < 3; i++)
+                        if (nearest[i] == null) missing.Add(roleNames[i]);
+                    ed.WriteMessage(
+                        "\n[Картограмма] Тройка не перенесена — не найдена метка: " +
+                        string.Join(", ", missing) + ". Переносим только полную тройку.");
                     trans.Commit();
                     return false;
                 }
@@ -541,8 +595,38 @@ namespace KartogrammaPlugin
                     w.Location = w.Location + delta;
                 }
 
+                // Ручная тройка (DrawManualTriple) рисует под собой собственное
+                // перекрестье — две линии на слое рабочих отметок с серединой
+                // точно в узле. При переносе тройки старое перекрестье убираем,
+                // иначе на чертеже остаются два креста: старый в исходной точке
+                // и новый «+»-маркер на новом месте. Заодно снимаем «+»-маркер
+                // предыдущей выноски (слой таблицы) — повторный перенос той же
+                // тройки не копит кресты. Ищем по середине линии: у обеих линий
+                // перекрестья она совпадает с узлом; линии сетки живут на своём
+                // слое, а у линии-выноски середина в узле не лежит.
+                double crossTol = sh * 0.5;
+                var crossIds = new List<ObjectId>();
+                foreach (ObjectId id in ms)
+                {
+                    if (trans.GetObject(id, OpenMode.ForRead) is not Line ln) continue;
+                    if (ln.Layer != _o.WorkLayerName && ln.Layer != _o.TableLayerName) continue;
+                    double mx = (ln.StartPoint.X + ln.EndPoint.X) * 0.5;
+                    double my = (ln.StartPoint.Y + ln.EndPoint.Y) * 0.5;
+                    double dx = mx - origin.X, dy = my - origin.Y;
+                    if (Math.Sqrt(dx * dx + dy * dy) <= crossTol)
+                        crossIds.Add(id);
+                }
+                foreach (var id in crossIds)
+                {
+                    var ln = (Line)trans.GetObject(id, OpenMode.ForWrite);
+                    ln.Erase();
+                }
+
                 // Линия-выноска из исходного узла к новому месту + «+»-маркер
-                // в новом месте (разделяет тройку на 3 квадранта как у узла сетки).
+                // в новом месте (разделяет тройку на 3 квадранта как у узла
+                // сетки). В исходной точке никаких крестиков не рисуем: у тройки
+                // должно остаться ровно одно перекрестье — на новом месте, а
+                // исходную точку показывает начало линии-выноски.
                 double arm = _o.SmallTextHeight * 1.2;
                 double cA  = Math.Cos(_o.RotationRadians);
                 double sA  = Math.Sin(_o.RotationRadians);
@@ -914,6 +998,17 @@ namespace KartogrammaPlugin
             double ang  = _o.RotationRadians;
             double cosA = Math.Cos(ang), sinA = Math.Sin(ang);
 
+            // Режим раскладки — автоматически по заданным границам:
+            //  • внешняя + внутренние («дырки») — траншея-рамка: точная посадка
+            //    исходной 1.1.2 (минимум ячеек, сетка натянута на границу —
+            //    яма/зумпф попадает в свою ячейку со своим объёмом);
+            //  • только внешняя, либо границы автоматически — котлован: целые
+            //    квадраты в середине + узкие краевые обрезки (стиль 1.1.1).
+            bool wholeCells = _innerPtsList == null || _innerPtsList.Count == 0;
+            ed.WriteMessage(wholeCells
+                ? "\n[Картограмма] Раскладка сетки: целые квадраты в середине (котлован)"
+                : "\n[Картограмма] Раскладка сетки: точно по границе (траншея с внутренними границами)");
+
             // Проекция мировых координат в ЛОКАЛЬНЫЕ (ось X = направление сетки)
             double ToLX(double wx, double wy) => wx * cosA + wy * sinA;
             double ToLY(double wx, double wy) => -wx * sinA + wy * cosA;
@@ -937,8 +1032,8 @@ namespace KartogrammaPlugin
                 }
 
                 double gW = gMaxLX - gMinLX, gH = gMaxLY - gMinLY;
-                LayoutGridAxis(gMinLX, gMaxLX, sx, out cols, out double gBaseLX);
-                LayoutGridAxis(gMinLY, gMaxLY, sy, out rows, out double gBaseLY);
+                LayoutGridAxis(gMinLX, gMaxLX, sx, wholeCells, out cols, out double gBaseLX);
+                LayoutGridAxis(gMinLY, gMaxLY, sy, wholeCells, out rows, out double gBaseLY);
 
                 if (_o.AutoBasePoint)
                     SetBaseFromLocal(gBaseLX, gBaseLY, cosA, sinA);
@@ -1046,8 +1141,8 @@ namespace KartogrammaPlugin
             double realH = maxLY - minLY;
             ed.WriteMessage($"\n[Картограмма] Зона (локальная): {realW:F3}×{realH:F3} м");
 
-            LayoutGridAxis(minLX, maxLX, sx, out cols, out double baseLX);
-            LayoutGridAxis(minLY, maxLY, sy, out rows, out double baseLY);
+            LayoutGridAxis(minLX, maxLX, sx, wholeCells, out cols, out double baseLX);
+            LayoutGridAxis(minLY, maxLY, sy, wholeCells, out rows, out double baseLY);
 
             if (_o.AutoBasePoint)
             {
@@ -1058,27 +1153,32 @@ namespace KartogrammaPlugin
 
         // ═══════════════════════════════════════════════════════════════════════
         //  Раскладка сетки по одной оси: сколько ячеек и где начало сетки.
-        //  Объединяет поведение 1.1.1 (котлован) и 1.1.2 (узкая траншея):
-        //    • зона у́же одной ячейки (узкая траншея) → 1 ячейка, зона по центру —
-        //      траншея целиком сидит в одном ряду, а не на стыке двух;
-        //    • ширина зоны кратна шагу → ровно n ячеек, сетка совпадает с
-        //      границей зоны (точная посадка);
-        //    • иначе → n целых ячеек в середине зоны + два симметричных краевых
-        //      обрезка (как в 1.1.1): внутренность замощена целыми квадратами,
-        //      граница режет только тонкие краевые полосы — читаемо, отметки
-        //      ложатся и на целые квадраты, и на бровку.
+        //  Режим выбирается автоматически по заданным границам (CalcAutoGrid):
+        //
+        //  wholeCells = false (внешняя + внутренние границы, траншея-рамка) —
+        //    ТОЧНАЯ посадка исходной 1.1.2: минимум ячеек ceil(W/шаг), сетка
+        //    натянута на границу, излишек поровну с двух сторон — яма/зумпф
+        //    попадает в свою ячейку со своим объёмом.
+        //
+        //  wholeCells = true (только внешняя граница или авто) — раскладка 1.1.1
+        //    для котлованов: n целых ячеек в середине зоны + два симметричных
+        //    краевых обрезка; внутренность замощена целыми квадратами.
+        //
+        //  Общее в обоих режимах:
+        //    • зона у́же одной ячейки (узкая траншея) → 1 ячейка, зона по центру;
+        //    • ширина зоны кратна шагу → ровно n ячеек, сетка совпадает с границей.
         // ═══════════════════════════════════════════════════════════════════════
         internal static void LayoutGridAxis(double zoneMin, double zoneMax, double step,
-            out int count, out double gridMin)
+            bool wholeCells, out int count, out double gridMin)
         {
             double w = Math.Max(zoneMax - zoneMin, 0.0);
             const double tol = 1e-3;                    // 1 мм: считаем «кратно шагу»
             int n = (int)Math.Floor(w / step + 1e-9);
             double rem = w - n * step;
 
-            if      (n <= 0)     count = 1;             // зона у́же одной ячейки
-            else if (rem <= tol) count = n;             // точная посадка
-            else                 count = n + 2;         // n целых + 2 краевых обрезка
+            if      (n <= 0)     count = 1;                         // у́же одной ячейки
+            else if (rem <= tol) count = n;                         // точная посадка
+            else                 count = wholeCells ? n + 2 : n + 1; // 1.1.1 / 1.1.2
             count = Clamp(count, 1, 500);
 
             gridMin = zoneMin - (count * step - w) / 2.0;   // излишек поровну с двух сторон
@@ -1246,7 +1346,9 @@ namespace KartogrammaPlugin
                 // (FindBoundaryPoint). IsInBounds сам учитывает DontClipCells:
                 // «обрезать» → клипать наружную границу и «дырки»;
                 // «не обрезать» → клипать только «дырки», наружная игнорируется.
-                if (e1.HasValue && e2.HasValue && IsInBounds(wx[si, sj], wy[si, sj]))
+                // Зоны резких перепадов исключаются — их объём считается отдельно.
+                if (e1.HasValue && e2.HasValue && IsInBounds(wx[si, sj], wy[si, sj])
+                    && !InAnomalyZoneW(wx[si, sj], wy[si, sj]))
                     h[si, sj] = e2.Value - e1.Value;
                 else
                     h[si, sj] = double.NaN;
@@ -1301,7 +1403,7 @@ namespace KartogrammaPlugin
                 double wy = _o.BaseY + lx * sinA + ly * cosA;
                 double? e1 = GetElevS(s1, wx, wy);
                 double? e2 = GetElevS(s2, wx, wy);
-                if (!e1.HasValue || !e2.HasValue) continue;
+                if (!e1.HasValue || !e2.HasValue || InAnomalyZoneW(wx, wy)) continue;
                 sum += e2.Value - e1.Value;
                 cnt++;
             }
@@ -1358,6 +1460,7 @@ namespace KartogrammaPlugin
                 if (!GetElevS(s1, wx, wy).HasValue) continue;
                 if (!GetElevS(s2, wx, wy).HasValue) continue;
                 if (!IsInClipRegion(wx, wy)) continue;
+                if (InAnomalyZoneW(wx, wy)) continue;   // объём зоны — отдельно
 
                 inside++;
             }
@@ -1463,9 +1566,10 @@ namespace KartogrammaPlugin
                 double midY = (loY + hiY) * 0.5;
                 double? e1  = GetElevS(s1, midX, midY);
                 double? e2  = GetElevS(s2, midX, midY);
-                // Точка считается валидной только если обе поверхности
-                // имеют данные И точка внутри полигонных границ.
-                if (e1.HasValue && e2.HasValue && IsInBounds(midX, midY))
+                // Точка считается валидной только если обе поверхности имеют
+                // данные И точка внутри полигонных границ И вне зон перепадов.
+                if (e1.HasValue && e2.HasValue && IsInBounds(midX, midY)
+                    && !InAnomalyZoneW(midX, midY))
                     { loX = midX; loY = midY; }
                 else
                     { hiX = midX; hiY = midY; }
@@ -1474,7 +1578,8 @@ namespace KartogrammaPlugin
             // Берём последнюю валидную точку как граничную
             double? h1 = GetElevS(s1, loX, loY);
             double? h2 = GetElevS(s2, loX, loY);
-            double hBnd = (h1.HasValue && h2.HasValue && IsInBounds(loX, loY))
+            double hBnd = (h1.HasValue && h2.HasValue && IsInBounds(loX, loY)
+                           && !InAnomalyZoneW(loX, loY))
                 ? h2.Value - h1.Value : 0.0;
             return (loX, loY, hBnd);
         }
@@ -2093,9 +2198,10 @@ namespace KartogrammaPlugin
         {
             var ed  = _doc.Editor;
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
-            // Высота шрифта таблицы — не более 40% от минимального шага сетки,
-            // чтобы текст гарантированно помещался в ячейку
-            double sh  = Math.Min(_o.TableTextHeight, Math.Min(szX, szY) * 0.4);
+            // Высота шрифта таблицы — ровно как задал пользователь: все ячейки,
+            // кроме колонок данных (они привязаны к шагу сетки), верстаются
+            // «впритык» к тексту и масштабируются пропорционально шрифту.
+            double sh  = _o.TableTextHeight;
             double ang = _o.RotationRadians;
             int    tc  = _o.ColorTable;
 
@@ -2127,12 +2233,37 @@ namespace KartogrammaPlugin
             // ════════════════════════════════════════════════════════════════════
             if (pos == 2 || pos == 3)
             {
-                double gap    = szX;
-                double colW   = szX;                                    // ширина каждого столбца = шаг X
-                double itogH  = sh * 2.0;                              // высота строки «Итого, м³» — впритык к тексту
-                double labelH = Math.Max(szY * 1.5,   sh * 7.0);       // высота строки заголовков «Насыпь/Выемка»
-                double vsegoH = sh * 2.0;                              // высота строки «Всего, м³» — впритык к тексту
-                double totalH = szY;                                    // высота строки итогов
+                double gap = szX;
+                double pad = sh * 0.6;   // «воздух»: по 0.3 высоты текста с каждой стороны
+
+                // Строки значений нужны заранее — по самым длинным меряется ширина колонок
+                string sFillTot = totFill > 0.001 ? "+" + totFill.ToString("F2") : "–";
+                string sCutTot  = totCut  > 0.001 ? "–" + totCut.ToString("F2")  : "–";
+                string longFill = sFillTot, longCut = sCutTot;
+                for (int gr = 0; gr < rows; gr++)
+                {
+                    string fs = rowFill[gr] > 0.001 ? "+" + rowFill[gr].ToString("F2") : "–";
+                    string cs = rowCut[gr]  > 0.001 ? "–" + rowCut[gr].ToString("F2")  : "–";
+                    if (fs.Length > longFill.Length) longFill = fs;
+                    if (cs.Length > longCut.Length)  longCut  = cs;
+                }
+
+                // ── Точная вёрстка по фактической ширине текста ──────────────
+                // Ширину таблицы задают: самая длинная цифра в колонке (впритык)
+                // и горизонтальные «Итого, м³»/«Всего, м³» на две колонки.
+                double wItog  = MeasureTextWidth(t, "Итого, м³", sh);
+                double wVsego = MeasureTextWidth(t, "Всего, м³", sh);
+                double colW   = Math.Max(
+                    Math.Max(MeasureTextWidth(t, longFill, sh),
+                             MeasureTextWidth(t, longCut,  sh)) + pad,
+                    (Math.Max(wItog, wVsego) + pad) / 2.0);
+
+                double itogH  = sh + pad;                     // «Итого, м³» — одна строка впритык
+                // «Насыпь»/«Выемка» вертикально — высота по длине текста впритык
+                double labelH = Math.Max(MeasureTextWidth(t, "Насыпь", sh),
+                                         MeasureTextWidth(t, "Выемка", sh)) + pad;
+                double vsegoH = sh + pad;                     // «Всего, м³» — одна строка впритык
+                double totalH = sh + pad;                     // строка итоговых цифр впритык
 
                 // Индексы строк
                 int iItog  = 0;
@@ -2171,12 +2302,8 @@ namespace KartogrammaPlugin
                 }
 
                 // Итоги
-                SetCell(tbl, iTotal, 0,
-                    totFill > 0.001 ? "+" + totFill.ToString("F2") : "–",
-                    sh, CellAlignment.MiddleCenter, tc);
-                SetCell(tbl, iTotal, 1,
-                    totCut > 0.001 ? "–" + totCut.ToString("F2") : "–",
-                    sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, iTotal, 0, sFillTot, sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, iTotal, 1, sCutTot,  sh, CellAlignment.MiddleCenter, tc);
 
                 // Мержим «Итого, м³» и «Всего, м³» по двум столбцам
                 tbl.MergeCells(CellRange.Create(tbl, iItog,  0, iItog,  1));
@@ -2195,6 +2322,11 @@ namespace KartogrammaPlugin
                 tbl.Cells[iLabel, 0].Contents[0].Rotation = Math.PI * 0.5;
                 SetCell(tbl, iLabel, 1, "Выемка", sh, CellAlignment.MiddleCenter, tc);
                 tbl.Cells[iLabel, 1].Contents[0].Rotation = Math.PI * 0.5;
+
+                // Контрольное восстановление размеров: заполнение ячеек и поворот
+                // контента могли снова включить авто-подгон
+                for (int c = 0; c < tblCols; c++) tbl.Columns[c].Width = colW;
+                for (int r = 0; r < tblRows; r++) tbl.Rows[r].Height = rowHeights[r];
 
                 // Insertion Y = gridHeight + itogH + labelH → строки данных совпадают с рядами сетки
                 double tblLocalX = offX + (pos == 2 ? -(tableW + gap) : gridWidth + gap);
@@ -2229,13 +2361,32 @@ namespace KartogrammaPlugin
             //  Столбцы данных совпадают по ширине и положению с ячейками сетки.
             // ════════════════════════════════════════════════════════════════════
             {
-                double gap    = szY;
-                double rH     = szY;
+                double gap = szY;
+                double pad = sh * 0.6;   // «воздух»: по 0.3 высоты текста с каждой стороны
+
+                // Итоговые строки нужны заранее — по ним меряется ширина ячеек
+                string sFillTot = totFill > 0.001 ? "+" + totFill.ToString("F2") : "–";
+                string sCutTot  = totCut  > 0.001 ? "–" + totCut.ToString("F2")  : "–";
+
+                // ── Точная вёрстка по фактической ширине текста ──────────────
+                // Высоту таблицы задаёт ВЕРТИКАЛЬНОЕ «Итого, м³»: две строки
+                // делят его длину пополам — текст помещается впритык.
+                double wItog  = MeasureTextWidth(t, "Итого, м³", sh);
+                double wVsego = MeasureTextWidth(t, "Всего, м³", sh);
+                double rH     = (Math.Max(wItog, wVsego) + pad) / 2.0;
                 double tblH   = 2.0 * rH;
-                double labelW = Math.Max(szX * 1.5, sh * 7.0);
-                double itogW  = sh * 2.0;                              // ширина «Итого, м³» — впритык к тексту
-                double vsegoW = sh * 2.0;                              // ширина «Всего, м³» — впритык к тексту
-                double totalW = Math.Max(szX * 1.5, sh * 7.0);
+
+                // «Насыпь»/«Выемка» — по ширине текста впритык
+                double labelW = Math.Max(MeasureTextWidth(t, "Насыпь", sh),
+                                         MeasureTextWidth(t, "Выемка", sh)) + pad;
+
+                // Колонки повёрнутого текста: ширина = высота строки текста
+                double itogW  = sh + pad;
+                double vsegoW = sh + pad;
+
+                // Последняя колонка — впритык к итоговой цифре
+                double totalW = Math.Max(MeasureTextWidth(t, sFillTot, sh),
+                                         MeasureTextWidth(t, sCutTot,  sh)) + pad;
 
                 // Индексы столбцов
                 int iItog  = 0;
@@ -2268,9 +2419,7 @@ namespace KartogrammaPlugin
                     string val = colFill[c] > 0.001 ? "+" + colFill[c].ToString("F2") : "–";
                     SetCell(tbl, 0, iData0 + c, val, sh, CellAlignment.MiddleCenter, tc);
                 }
-                SetCell(tbl, 0, iTotal,
-                    totFill > 0.001 ? "+" + totFill.ToString("F2") : "–",
-                    sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, 0, iTotal, sFillTot, sh, CellAlignment.MiddleCenter, tc);
 
                 // Выемка (строка 1)
                 SetCell(tbl, 1, iLabel, "Выемка", sh, CellAlignment.MiddleCenter, tc);
@@ -2279,9 +2428,7 @@ namespace KartogrammaPlugin
                     string val = colCut[c] > 0.001 ? "–" + colCut[c].ToString("F2") : "–";
                     SetCell(tbl, 1, iData0 + c, val, sh, CellAlignment.MiddleCenter, tc);
                 }
-                SetCell(tbl, 1, iTotal,
-                    totCut > 0.001 ? "–" + totCut.ToString("F2") : "–",
-                    sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, 1, iTotal, sCutTot, sh, CellAlignment.MiddleCenter, tc);
 
                 // Мержим «Итого, м³» и «Всего, м³» по двум строкам
                 tbl.MergeCells(CellRange.Create(tbl, 0, iItog,  1, iItog));
@@ -2298,6 +2445,11 @@ namespace KartogrammaPlugin
                 tbl.Cells[0, iItog].Contents[0].Rotation  = Math.PI * 0.5;
                 SetCell(tbl, 0, iVsego, "Всего, м³", sh, CellAlignment.MiddleCenter, tc);
                 tbl.Cells[0, iVsego].Contents[0].Rotation = Math.PI * 0.5;
+
+                // Контрольное восстановление размеров: заполнение ячеек и поворот
+                // контента могли снова включить авто-подгон
+                for (int c = 0; c < tblCols; c++) tbl.Columns[c].Width = colWidths[c];
+                for (int r = 0; r < tblRows; r++) tbl.Rows[r].Height = rH;
 
                 // Таблица начинается с X = offX-(itogW+labelW) → столбцы данных совпадают с активной областью
                 double tblLocalX = offX - (itogW + labelW);
@@ -2336,7 +2488,31 @@ namespace KartogrammaPlugin
             }
         }
 
-/// <summary>Создать таблицу с отключённым авто-подгоном размеров</summary>
+        /// <summary>
+        /// Фактическая ширина строки текста в единицах чертежа для стиля таблицы
+        /// и заданной высоты. Временный DBText добавляется в модель и сразу
+        /// удаляется — единственный надёжный способ учесть метрику шрифта
+        /// (ширины букв различаются у разных стилей). Используется для точной
+        /// вёрстки итоговой таблицы «впритык» к тексту при любом размере шрифта.
+        /// </summary>
+        private double MeasureTextWidth(Transaction t, string text, double height)
+        {
+            try
+            {
+                var txt = new DBText { TextString = text, Height = height };
+                txt.SetDatabaseDefaults();
+                if (!_tblTsId.IsNull) txt.TextStyleId = _tblTsId;
+                _ms.AppendEntity(txt);
+                t.AddNewlyCreatedDBObject(txt, true);
+                var ext = txt.GeometricExtents;
+                double w = ext.MaxPoint.X - ext.MinPoint.X;
+                txt.Erase();
+                return w;
+            }
+            catch { return text.Length * height * 0.62; }   // грубая оценка по числу знаков
+        }
+
+        /// <summary>Создать таблицу с отключённым авто-подгоном размеров</summary>
         private Autodesk.AutoCAD.DatabaseServices.Table CreateFixedTable(int rows, int cols)
         {
             var tbl = new Autodesk.AutoCAD.DatabaseServices.Table();
@@ -2489,15 +2665,69 @@ namespace KartogrammaPlugin
 
         private void PrepareElevationCache(CivilSurface s1, CivilSurface s2)
         {
+            // Аварийный выключатель для диагностики: KARTOGRAMMA_NOCACHE=1 →
+            // все отметки идут через Civil API, как до ускорения. Позволяет
+            // проверить, влияет ли кеш на результат, не пересобирая плагин.
+            if (Environment.GetEnvironmentVariable("KARTOGRAMMA_NOCACHE") == "1")
+            {
+                _snap1 = _snap2 = null;
+                _snapSurf1 = _snapSurf2 = null;
+                _doc.Editor.WriteMessage(
+                    "\n[Картограмма] Кеш поверхностей ОТКЛЮЧЁН (KARTOGRAMMA_NOCACHE=1) — отметки через Civil API.");
+                return;
+            }
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            _snap1 = s1 is TinSurface t1 ? TinSnapshot.Build(t1) : null;
-            _snap2 = s2 is TinSurface t2 ? TinSnapshot.Build(t2) : null;
+            _snap1 = s1 is TinSurface t1 ? VerifySnapshot(s1, TinSnapshot.Build(t1)) : null;
+            _snap2 = s2 is TinSurface t2 ? VerifySnapshot(s2, TinSnapshot.Build(t2)) : null;
             _snapSurf1 = _snap1 != null ? s1 : null;
             _snapSurf2 = _snap2 != null ? s2 : null;
             if (_snap1 != null || _snap2 != null)
                 _doc.Editor.WriteMessage(
                     $"\n[Картограмма] Кеш поверхностей: {_snap1?.TriangleCount ?? 0} + " +
                     $"{_snap2?.TriangleCount ?? 0} треугольников за {sw.ElapsedMilliseconds} мс");
+        }
+
+        /// <summary>
+        /// Самопроверка снимка TIN: сетка контрольных точек по габаритам
+        /// поверхности сравнивается с FindElevationAtXY. Любое расхождение
+        /// (есть/нет данных или |Δz| &gt; 1 мм) означает семантику, которую
+        /// снимок не воспроизвёл (например, экзотические границы поверхности) —
+        /// тогда снимок отбрасывается и отметки идут через Civil API:
+        /// медленнее, но гарантированно совпадает с Civil.
+        /// </summary>
+        private TinSnapshot? VerifySnapshot(CivilSurface s, TinSnapshot? snap)
+        {
+            if (snap == null) return null;
+            try
+            {
+                // 40×40 = 1600 контрольных точек: достаточно плотно, чтобы
+                // зацепить даже маленькие локальные зоны (зумпф, приямок) —
+                // при этом разовая стоимость ~тысячи API-вызовов незаметна.
+                var e = s.GeometricExtents;
+                const int N = 40;
+                double stX = (e.MaxPoint.X - e.MinPoint.X) / N;
+                double stY = (e.MaxPoint.Y - e.MinPoint.Y) / N;
+                int bad = 0;
+                for (int i = 0; i < N; i++)
+                for (int j = 0; j < N; j++)
+                {
+                    // Полуотступ — не попадать ровно на кромки/углы поверхности
+                    double x = e.MinPoint.X + (j + 0.5) * stX;
+                    double y = e.MinPoint.Y + (i + 0.5) * stY;
+                    double? zApi  = GetElev(s, x, y);
+                    double? zSnap = snap.Elevation(x, y);
+                    if (zApi.HasValue != zSnap.HasValue) { bad++; continue; }
+                    if (zApi.HasValue && Math.Abs(zApi.Value - zSnap!.Value) > 1e-3) bad++;
+                }
+                if (bad == 0) return snap;
+
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] Кеш '{s.Name}': расхождение с Civil API в {bad}/{N * N} " +
+                    "контрольных точек — кеш отключён, отметки считаются через API (медленнее, но точно).");
+                return null;
+            }
+            catch { return snap; }
         }
 
         /// <summary>Отметка поверхности: из снимка (быстро, потокобезопасно),
@@ -2507,6 +2737,161 @@ namespace KartogrammaPlugin
             if (ReferenceEquals(surf, _snapSurf1)) return _snap1!.Elevation(x, y);
             if (ReferenceEquals(surf, _snapSurf2)) return _snap2!.Elevation(x, y);
             return GetElev(surf, x, y);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Зоны резких перепадов (зумпф, приямок, локальная насыпь).
+        //  Рабочие отметки сканируются по всей сетке; компактные области, где
+        //  |h − медиана| резко выше остального поля (AnomalyDetector), выделяются
+        //  ОТДЕЛЬНЫМИ квадратами: объём зоны считается и подписывается отдельно,
+        //  а из обычных ячеек вырезается — картограмма сразу показывает, сколько
+        //  грунта на траншею/котлован и сколько на разработку под зумпф.
+        //  Прямоугольники зон — в ЛОКАЛЬНЫХ координатах сетки.
+        // ═══════════════════════════════════════════════════════════════════════
+        private List<(double x0, double y0, double x1, double y1)>? _anomalyZones;
+        private double _zoneCos = 1.0, _zoneSin;
+
+        private void DetectAnomalyZones(CivilSurface s1, CivilSurface s2,
+            int rows, int cols, double cosA, double sinA)
+        {
+            _anomalyZones = null;
+            _zoneCos = cosA; _zoneSin = sinA;
+
+            double W = cols * _o.CellSizeX, H = rows * _o.CellSizeY;
+            if (W <= 0 || H <= 0) return;
+
+            // Шаг сэмплирования: достаточно мелкий, чтобы увидеть зумпф ~1×1 м.
+            // Без кеша поверхностей — грубее и с жёстким потолком числа вызовов.
+            bool fast = _snap1 != null && _snap2 != null;
+            double st = Math.Min(_o.CellSizeX, _o.CellSizeY) / (fast ? 40.0 : 10.0);
+            long cap = fast ? 400_000 : 25_000;
+            while ((long)(W / st + 1) * (long)(H / st + 1) > cap) st *= 1.5;
+
+            int nj = Math.Max(4, (int)Math.Round(W / st));
+            int ni = Math.Max(4, (int)Math.Round(H / st));
+            double stX = W / nj, stY = H / ni;
+
+            var h = new double[ni, nj];
+            for (int i = 0; i < ni; i++)
+            for (int j = 0; j < nj; j++)
+            {
+                double lx = (j + 0.5) * stX, ly = (i + 0.5) * stY;
+                double wx = _o.BaseX + lx * cosA - ly * sinA;
+                double wy = _o.BaseY + lx * sinA + ly * cosA;
+                double? e1 = GetElevS(s1, wx, wy);
+                double? e2 = GetElevS(s2, wx, wy);
+                h[i, j] = (e1.HasValue && e2.HasValue && IsInClipRegion(wx, wy))
+                    ? e2.Value - e1.Value : double.NaN;
+            }
+
+            // Локальный перепад не может быть крупнее ~2 ячеек — иначе это рельеф
+            int maxSide = (int)Math.Ceiling(
+                2.0 * Math.Max(_o.CellSizeX, _o.CellSizeY) / Math.Min(stX, stY));
+
+            var zones = AnomalyDetector.FindZones(h, minDev: 1.0, minCount: 4,
+                maxSide: maxSide, maxZones: 10, peakFactor: 2.5);
+            if (zones.Count == 0) return;
+
+            // Индексные bbox → локальные прямоугольники с запасом в 2 сэмпла
+            // (захватываем стенку перепада, оставшуюся ниже порога)
+            var rects = new List<(double x0, double y0, double x1, double y1)>();
+            foreach (var z in zones)
+            {
+                double x0 = Math.Max(0, (z.j0 - 2) * stX);
+                double x1 = Math.Min(W, (z.j1 + 3) * stX);
+                double y0 = Math.Max(0, (z.i0 - 2) * stY);
+                double y1 = Math.Min(H, (z.i1 + 3) * stY);
+                rects.Add((x0, y0, x1, y1));
+            }
+
+            // Слить пересекающиеся прямоугольники (после расширения зоны могли слипнуться)
+            bool merged = true;
+            while (merged)
+            {
+                merged = false;
+                for (int a = 0; a < rects.Count && !merged; a++)
+                for (int b = a + 1; b < rects.Count && !merged; b++)
+                {
+                    var ra = rects[a]; var rb = rects[b];
+                    bool overlap = ra.x0 <= rb.x1 && rb.x0 <= ra.x1 &&
+                                   ra.y0 <= rb.y1 && rb.y0 <= ra.y1;
+                    if (!overlap) continue;
+                    rects[a] = (Math.Min(ra.x0, rb.x0), Math.Min(ra.y0, rb.y0),
+                                Math.Max(ra.x1, rb.x1), Math.Max(ra.y1, rb.y1));
+                    rects.RemoveAt(b);
+                    merged = true;
+                }
+            }
+
+            _anomalyZones = rects;
+            for (int k = 0; k < rects.Count; k++)
+            {
+                var z = rects[k];
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] Резкий перепад #{k + 1}: зона {z.x1 - z.x0:F1}×{z.y1 - z.y0:F1} м — выделена отдельной ячейкой.");
+            }
+        }
+
+        /// <summary>Точка (мировая) внутри одной из зон резкого перепада —
+        /// такие точки исключаются из объёма обычных ячеек (объём зоны
+        /// считается и подписывается отдельно).</summary>
+        private bool InAnomalyZoneW(double wx, double wy)
+        {
+            var zs = _anomalyZones;
+            if (zs == null) return false;
+            double dx = wx - _o.BaseX, dy = wy - _o.BaseY;
+            double lx = dx * _zoneCos + dy * _zoneSin;
+            double ly = -dx * _zoneSin + dy * _zoneCos;
+            for (int k = 0; k < zs.Count; k++)
+            {
+                var z = zs[k];
+                if (lx >= z.x0 && lx <= z.x1 && ly >= z.y0 && ly <= z.y1) return true;
+            }
+            return false;
+        }
+
+        /// <summary>Объём и площадь перекрытия внутри зоны перепада
+        /// (midpoint-интегрирование с шагом субсетки объёмов).</summary>
+        private void CalcZoneVolume((double x0, double y0, double x1, double y1) z,
+            CivilSurface s1, CivilSurface s2, double cosA, double sinA,
+            out double vol, out double area)
+        {
+            vol = 0; area = 0;
+            double w = z.x1 - z.x0, ht = z.y1 - z.y0;
+            if (w <= 0 || ht <= 0) return;
+
+            int n = Clamp((int)Math.Ceiling(
+                Math.Max(w, ht) / Math.Max(_o.VolumeNodeStep, 1e-6)), 8, 400);
+            double dx = w / n, dy = ht / n, dA = dx * dy;
+
+            for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double lx = z.x0 + (j + 0.5) * dx;
+                double ly = z.y0 + (i + 0.5) * dy;
+                double wx = _o.BaseX + lx * cosA - ly * sinA;
+                double wy = _o.BaseY + lx * sinA + ly * cosA;
+                double? e1 = GetElevS(s1, wx, wy);
+                double? e2 = GetElevS(s2, wx, wy);
+                if (!e1.HasValue || !e2.HasValue || !IsInBounds(wx, wy)) continue;
+                vol  += (e2.Value - e1.Value) * dA;
+                area += dA;
+            }
+        }
+
+        /// <summary>Нарисовать рамку зоны перепада на слое сетки.</summary>
+        private void DrawZoneRect(Transaction t,
+            (double x0, double y0, double x1, double y1) z, double cosA, double sinA)
+        {
+            var pl = new Polyline();
+            pl.AddVertexAt(0, ToUcs2d(LW(z.x0, z.y0, cosA, sinA)), 0, 0, 0);
+            pl.AddVertexAt(1, ToUcs2d(LW(z.x1, z.y0, cosA, sinA)), 0, 0, 0);
+            pl.AddVertexAt(2, ToUcs2d(LW(z.x1, z.y1, cosA, sinA)), 0, 0, 0);
+            pl.AddVertexAt(3, ToUcs2d(LW(z.x0, z.y1, cosA, sinA)), 0, 0, 0);
+            pl.Closed = true;
+            pl.Layer  = _o.GridLayerName;
+            _ms.AppendEntity(pl);
+            t.AddNewlyCreatedDBObject(pl, true);
         }
 
         private void EnsureLayer(Transaction trans, string name, int aci)

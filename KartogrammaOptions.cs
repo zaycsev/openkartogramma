@@ -26,6 +26,8 @@ namespace KartogrammaPlugin
         public double BaseX         { get; set; } = 0.0;
         public double BaseY         { get; set; } = 0.0;
         public bool   DontClipCells { get; set; } = false;
+        // Режим раскладки сетки (точно по границе / целые квадраты в середине)
+        // выбирается автоматически по заданным границам — см. CalcAutoGrid.
 
         // ── Границы ────────────────────────────────────────────────────────────
         public bool     AutoBounds      { get; set; } = true;

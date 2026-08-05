@@ -16,8 +16,9 @@ namespace KartogrammaPlugin
         private NumericUpDown _nudAci  = null!;
         private Label         _lblName = null!;
 
-        // Размер одного квадратика
-        private const int SwW = 16, SwH = 14, Gap = 1;
+        // Размер одного квадратика при 96 DPI — фактический масштабируется (см. BuildUI)
+        private const int SwW0 = 16, SwH0 = 14, Gap0 = 1;
+        private int SwW = SwW0, SwH = SwH0, Gap = Gap0;
         // 24 цветовых тона (столбцы) × 11 строк (0 = стандарт, 1-10 = палитра)
         private const int Cols = 24, Rows = 11;
 
@@ -33,14 +34,31 @@ namespace KartogrammaPlugin
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox     = MinimizeBox = false;
             StartPosition   = FormStartPosition.CenterParent;
+            AutoScaleMode   = AutoScaleMode.None;   // масштабируем вручную
             Font            = new Font("Segoe UI", 8.5f);
+
+            // Всё в пикселях растим вместе с DPI: иначе на 150-200 % палитра
+            // остаётся крошечной, а подписи под ней — уже нет.
+            float dpiScale;
+            using (var g = CreateGraphics()) { dpiScale = g.DpiX / 96f; }
+            int S(int v) => (int)Math.Round(v * dpiScale);
+
+            SwW = S(SwW0);
+            SwH = S(SwH0);
+            Gap = Math.Max(1, S(Gap0));
+
+            // Без NoPadding: замер должен совпадать с отрисовкой Label,
+            // иначе подписи обрезает на последнем символе.
+            Size TextSize(string text)
+                => TextRenderer.MeasureText(text, Font, new Size(int.MaxValue, int.MaxValue),
+                                            TextFormatFlags.SingleLine);
 
             int gridW = Cols * (SwW + Gap) + 1;
             int gridH = Rows * (SwH + Gap) + 1;
 
             _grid = new PictureBox
             {
-                Location    = new Point(8, 8),
+                Location    = new Point(S(8), S(8)),
                 Size        = new Size(gridW, gridH),
                 BorderStyle = BorderStyle.FixedSingle,
                 Cursor      = Cursors.Hand
@@ -50,52 +68,98 @@ namespace KartogrammaPlugin
             _grid.MouseMove  += OnGridHover;
             Controls.Add(_grid);
 
-            int ctrlY = gridH + 14;
+            int ctrlY = _grid.Bottom + S(8);
+            int textH = TextSize("Ауj").Height;
+            int rowH  = Math.Max(S(22), textH + S(8));
 
-            Controls.Add(new Label { Text = "ACI:", Location = new Point(8, ctrlY + 4), AutoSize = true });
+            // Нижняя строка собирается слева направо по фактической ширине
+            // подписей — тогда ничто ни на что не наезжает при любом DPI.
+            int cx = S(8);
+
+            Label Lbl(string text)
+            {
+                var sz = TextSize(text);
+                var l = new Label
+                {
+                    Text      = text,
+                    Location  = new Point(cx, ctrlY + Math.Max(0, (rowH - textH) / 2)),
+                    Size      = new Size(sz.Width + 2, textH + 2),
+                    TextAlign = ContentAlignment.MiddleLeft
+                };
+                Controls.Add(l);
+                cx += l.Width + S(6);
+                return l;
+            }
+
+            Lbl("ACI:");
             _nudAci = new NumericUpDown
             {
                 Minimum = 1, Maximum = 255, Value = SelectedAci,
-                Location = new Point(36, ctrlY), Size = new Size(58, 22), DecimalPlaces = 0
+                Location = new Point(cx, ctrlY), Width = Math.Max(S(58), TextSize("255").Width + S(34)),
+                DecimalPlaces = 0
             };
             _nudAci.ValueChanged += (s, e) => SelectAci((int)_nudAci.Value);
+            _nudAci.Top = ctrlY + Math.Max(0, (rowH - _nudAci.Height) / 2);
             Controls.Add(_nudAci);
+            cx += _nudAci.Width + S(14);
 
-            Controls.Add(new Label { Text = "Цвет:", Location = new Point(104, ctrlY + 4), AutoSize = true });
+            Lbl("Цвет:");
             _preview = new Panel
             {
-                Location    = new Point(140, ctrlY),
-                Size        = new Size(48, 22),
+                Location    = new Point(cx, ctrlY),
+                Size        = new Size(S(48), rowH),
                 BackColor   = AciToColor(SelectedAci),
                 BorderStyle = BorderStyle.FixedSingle
             };
             Controls.Add(_preview);
+            cx += _preview.Width + S(10);
 
             _lblName = new Label
             {
                 Text      = AciName(SelectedAci),
-                Location  = new Point(198, ctrlY + 4),
+                Location  = new Point(cx, ctrlY + Math.Max(0, (rowH - textH) / 2)),
                 AutoSize  = true,
                 ForeColor = Color.Gray
             };
             Controls.Add(_lblName);
 
-            var btnOk = new Button
-            {
-                Text = "OK", DialogResult = DialogResult.OK,
-                Location = new Point(gridW - 106, ctrlY), Size = new Size(50, 26)
-            };
+            // Кнопки прижаты к правому краю, ширина — по надписи
+            int okW     = Math.Max(S(50), TextSize("OK").Width + S(24));
+            int cancelW = Math.Max(S(60), TextSize("Отмена").Width + S(24));
+            int btnH    = Math.Max(S(26), textH + S(10));
+            int btnY    = ctrlY + Math.Max(0, (rowH - btnH) / 2);
+
+            // Имя цвета должно помещаться целиком — если под него и кнопки
+            // палитры не хватает, окно расширяем, а не режем текст.
+            int nameW = Math.Max(TextSize("ACI 8 — Тёмно-серый").Width,
+                                 TextSize("ACI 255 — Серый").Width);
+            int right = Math.Max(_grid.Right,
+                                 cx + nameW + S(12) + okW + S(6) + cancelW);
+
             var btnCancel = new Button
             {
                 Text = "Отмена", DialogResult = DialogResult.Cancel,
-                Location = new Point(gridW - 52, ctrlY), Size = new Size(60, 26)
+                Location = new Point(right - cancelW, btnY), Size = new Size(cancelW, btnH)
+            };
+            var btnOk = new Button
+            {
+                Text = "OK", DialogResult = DialogResult.OK,
+                Location = new Point(right - cancelW - okW - S(6), btnY), Size = new Size(okW, btnH)
             };
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
 
+            // Имя цвета — подсказка серым; ограничиваем, чтобы не лезло на кнопки
+            _lblName.AutoSize     = false;
+            _lblName.Size         = new Size(Math.Max(S(40), btnOk.Left - S(10) - _lblName.Left),
+                                             textH + 2);
+            _lblName.TextAlign    = ContentAlignment.MiddleLeft;
+            _lblName.AutoEllipsis = true;
+
             AcceptButton = btnOk;
             CancelButton = btnCancel;
-            ClientSize   = new Size(gridW + 16, ctrlY + 36);
+            ClientSize   = new Size(right + S(8),
+                                    ctrlY + Math.Max(rowH, btnH) + S(10));
         }
 
         private void SelectAci(int aci)

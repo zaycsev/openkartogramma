@@ -26,7 +26,7 @@ namespace KartogrammaTests
     //  Копия логики расчёта объёма из KartogrammaProcessor.cs
     //  - CalcCellVolume делает полигонный клиппинг субтреугольников
     //  - Какие ячейки участвуют определяет CalcTotalVolume
-    //  - DontClipCells управляет включением Partial-ячеек
+    //  - ClipCells управляет включением Partial-ячеек
     // ═══════════════════════════════════════════════════════════════
     public class VolumeCalc
     {
@@ -274,7 +274,7 @@ namespace KartogrammaTests
         }
 
         // -----------------------------------------------------------
-        //  С границей: DontClipCells=true → все Partial включены
+        //  С границей, обрезка выключена (ClipCells=false) → все Partial включены
         //  Субтреугольники обрезаются по полигону → объём ≈ точному
         // -----------------------------------------------------------
         [Fact]
@@ -294,7 +294,7 @@ namespace KartogrammaTests
         }
 
         // -----------------------------------------------------------
-        //  С границей: DontClipCells=false — то же самое (Partial
+        //  С границей, обрезка включена (ClipCells=true) — то же самое (Partial
         //  всегда включены, клиппинг в CalcCellVolume)
         // -----------------------------------------------------------
         [Fact]
@@ -391,7 +391,7 @@ namespace KartogrammaTests
         }
 
         // -----------------------------------------------------------
-        //  Ромб: DontClipCells=true vs false
+        //  Ромб: без обрезки vs с обрезкой (ClipCells=false vs true)
         // -----------------------------------------------------------
         [Fact]
         public void DiamondBoundary_UnclippedVsClipped()

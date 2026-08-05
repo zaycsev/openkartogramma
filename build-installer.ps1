@@ -1,5 +1,5 @@
 param(
-    [string]$Version   = "1.1.2",
+    [string]$Version   = "1.1.3",
     [string]$Config    = "Release",
     [string]$InnoSetup = "",
     [string]$AcadPath  = ""
@@ -50,6 +50,13 @@ Ok "net48 done"
 Step "Assembling dist\bundle..."
 
 $distBundle = "$root\dist\bundle"
+
+# Чистим папку перед сборкой. В installer.iss файлы помечены
+# skipifsourcedoesntexist: если копирование ниже не состоится, в установщик
+# молча уедет DLL от ПРЕДЫДУЩЕЙ сборки. Пустая папка превращает такую
+# ситуацию в явную ошибку вместо порчи релиза.
+if (Test-Path $distBundle) { Remove-Item $distBundle -Recurse -Force }
+
 New-Item -ItemType Directory -Force -Path "$distBundle\Contents\net8"  | Out-Null
 New-Item -ItemType Directory -Force -Path "$distBundle\Contents\net48" | Out-Null
 
@@ -77,7 +84,10 @@ if (Test-Path $net48Src) {
     Copy-Item $net48Src "$distBundle\Contents\net48\" -Force
     Ok "net48\openkartogramma.dll"
 } else {
-    Info "net48 DLL not found - installer will only support Civil 3D 2025+"
+    # Референсные DLL лежат в libs\acad-refs, поэтому net48 обязан собираться
+    # на любой машине. Отсутствие DLL здесь — не «частичная поддержка», а
+    # сломанный релиз: пользователи Civil 3D 2015-2024 останутся без плагина.
+    Fail "net48 DLL not found: $net48Src"
 }
 
 # Step 4: generate installer graphics

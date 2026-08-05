@@ -161,6 +161,8 @@ namespace KartogrammaPlugin
                 EnsureLayer(trans, _o.DesignLayerName, _o.ColorDesign);
                 EnsureLayer(trans, _o.VolumeLayerName, _o.ColorVolume);
                 EnsureLayer(trans, _o.TableLayerName,  _o.ColorTable);
+                EnsureLayer(trans, _o.HatchLayerName,    _o.HatchCut.ColorAci);
+                EnsureLayer(trans, _o.ZeroLineLayerName, _o.ZeroLine.ColorAci);
 
                 var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
                 _ms = (BlockTableRecord)trans.GetObject(
@@ -175,6 +177,8 @@ namespace KartogrammaPlugin
                 EraseByLayer(trans, _ms, _o.DesignLayerName);
                 EraseByLayer(trans, _ms, _o.VolumeLayerName);
                 EraseByLayer(trans, _ms, _o.TableLayerName);
+                EraseByLayer(trans, _ms, _o.HatchLayerName);
+                EraseByLayer(trans, _ms, _o.ZeroLineLayerName);
 
                 // Наружная граница и внутренние «дырки» уже загружены выше в
                 // LoadManualBoundaries (_boundaryPts / _innerPtsList) — до CalcAutoGrid.
@@ -183,11 +187,16 @@ namespace KartogrammaPlugin
                 Report("Построение сетки…", 2);
                 DrawGridLines(trans, rows, cols, cosA, sinA, surf1!, surf2!);
 
+                // Штриховка выемки/насыпи и линия нулевых работ — по тем же
+                // ячейкам и по тому же признаку знака рабочей отметки, по
+                // которому делятся объёмы. Ничего не считает, только рисует.
+                DrawHatchAndZeroLine(trans, rows, cols, cosA, sinA, surf1!, surf2!);
+
                 // === Подписи отметок (чёрная / красная / рабочая) ===
                 // Отметки рисуются в каждом узле сетки (rows+1)×(cols+1).
                 // Узлы вне клип-области пропускаются (метки на «оторванных»
                 // узлах физического смысла не имеют).
-                Report("Построение подписей отметок…", 5);
+                Report("Построение подписей отметок…", 9);
                 var cells = BuildCells(surf1!, surf2!, rows, cols, cosA, sinA, area);
                 for (int nr = 0; nr <= rows; nr++)
                 for (int nc = 0; nc <= cols; nc++)
@@ -196,7 +205,7 @@ namespace KartogrammaPlugin
                 // Дополнительные тройки в точках пересечения границ с линиями
                 // сетки — это «углы» образованные обрезкой. Только в режиме
                 // «Обрезать»: в «не обрезать» квадраты целые, новых углов нет.
-                if (!_o.DontClipCells)
+                if (_o.ClipCells)
                     DrawBoundaryGridIntersectionLabels(trans, rows, cols, cosA, sinA, surf1!, surf2!);
 
                 // Подписи объёмов ячеек + подсчёт итогов (точный граничный расчёт)
@@ -226,6 +235,10 @@ namespace KartogrammaPlugin
                 // и т.п.) идёт последовательно — Civil API не потокобезопасен.
                 var volRes  = new double[totalCells];
                 var areaRes = new double[totalCells];
+                // Раздельные объёмы насыпи и выемки внутри ячейки — нужны там,
+                // где через ячейку проходит нулевая линия (см. ZeroLineSplit).
+                var fillRes = new double[totalCells];
+                var cutRes  = new double[totalCells];
 
                 void ComputeCell(int i)
                 {
@@ -239,13 +252,14 @@ namespace KartogrammaPlugin
                     // совпадает с площадью из «пульта объёмов» Civil.
                     if (_o.VolumeMethod == VolumeMethod.Squares)
                     {
-                        volRes[i]  = CalcCellVolumeSquares(dc.Row, dc.Col, surf1!, surf2!, cosA, sinA);
+                        volRes[i]  = CalcCellVolumeSquares(dc.Row, dc.Col, surf1!, surf2!,
+                            cosA, sinA, out fillRes[i], out cutRes[i]);
                         areaRes[i] = CalcCellEffectiveArea(dc.Row, dc.Col, surf1!, surf2!, cosA, sinA);
                     }
                     else
                     {
                         volRes[i] = CalcCellVolumeAccurate(dc.Row, dc.Col, surf1!, surf2!,
-                            cosA, sinA, out areaRes[i]);
+                            cosA, sinA, out areaRes[i], out fillRes[i], out cutRes[i]);
                     }
                 }
 
@@ -269,7 +283,8 @@ namespace KartogrammaPlugin
                     for (int ci = 0; ci < totalCells; ci++)
                         ed.WriteMessage(
                             $"\n[Отладка] Ячейка строка {dataCells[ci].Row + 1}, колонка {dataCells[ci].Col + 1}: " +
-                            $"V={volRes[ci]:F3} м³, S={areaRes[ci]:F2} м²");
+                            $"V={volRes[ci]:F3} м³, S={areaRes[ci]:F2} м², " +
+                            $"насыпь={fillRes[ci]:F3}, выемка={cutRes[ci]:F3}");
 
                 // ── Фаза 2: подписи и итоги (последовательно — работа с чертежом) ──
                 double totalArea = 0;
@@ -283,10 +298,30 @@ namespace KartogrammaPlugin
                     // (как в Civil — площадь не зависит от отсечения малых объёмов).
                     totalArea += cellArea;
 
-                    if (vol == 0.0) continue;          // ячейка полностью вне зоны
+                    double volFill = fillRes[ci], volCut = cutRes[ci];
+
+                    // ── Ячейка с нулевой линией ───────────────────────────────
+                    // Если через ячейку проходит линия нулевых работ, в ней
+                    // есть и насыпь, и выемка. Сальдо их гасит и скрывает
+                    // реальный объём работ, поэтому такие ячейки подписываются
+                    // ДВУМЯ цифрами — каждая в своей части ячейки — и в итоги
+                    // идут обеими частями. Мелкий «хвост» одного знака (меньше
+                    // порога отображения) за разделение не считаем: это обычная
+                    // однородная ячейка.
+                    //
+                    // Нижняя граница — не только заданный минимальный объём, но
+                    // и половина последнего разряда: иначе при отключённом
+                    // фильтре (MinVolume = 0) разделённой считалась бы КАЖДАЯ
+                    // ячейка, и по всему чертежу пошли бы пары вида «+0.00».
+                    double minShow = Math.Max(_o.MinVolume,
+                        0.5 * Math.Pow(10, -_o.VolumePrecision));
+                    bool splitCell = volFill >= minShow
+                                     && Math.Abs(volCut) >= minShow;
+
+                    if (!splitCell && vol == 0.0) continue;   // ячейка полностью вне зоны
 
                     double absVol = Math.Abs(vol);
-                    if (absVol < _o.MinVolume) continue;
+                    if (!splitCell && absVol < _o.MinVolume) continue;
 
                     // vol > 0 = насыпь (design > exist), vol < 0 = выемка
                     bool isCut = vol < 0;
@@ -296,18 +331,6 @@ namespace KartogrammaPlugin
                     double y0 = r * _o.CellSizeY;
                     double vh = _o.VolumeTextHeight;
 
-                    // Объём — по центру ячейки; для обрезанных ячеек подбираем
-                    // ближайшую точку внутри клип-области, чтобы метка не
-                    // попала за пределы оставшейся после обрезки геометрии.
-                    double cx = x0 + _o.CellSizeX * 0.5;
-                    double cy = y0 + _o.CellSizeY * 0.5;
-                    FindInsideAnchor(x0, y0, _o.CellSizeX, _o.CellSizeY,
-                        cx, cy, cosA, sinA, out double vLx, out double vLy);
-                    AddCenteredText(trans, _o.VolumeLayerName,
-                        LW(vLx, vLy, cosA, sinA),
-                        Signed(vol, _o.VolumePrecision),
-                        vh, angle, aci, hideMask: _o.HideMaskVolume);
-
                     // Округляем до точности отображения ДО суммирования, чтобы
                     // строчные/столбцовые/общие итоги совпадали с тем, что нарисовано
                     // в каждой ячейке (иначе двойное округление даёт расхождение
@@ -315,10 +338,47 @@ namespace KartogrammaPlugin
                     // а сумма видимых "-0.70"+"-0.02" = "-0.72").
                     // Парсим строку обратно — гарантированно совпадает с тем, что
                     // выведет ToString("Fn") в подписи ячейки.
-                    double dispVol = double.Parse(
-                        absVol.ToString("F" + _o.VolumePrecision,
+                    double Disp(double v) => double.Parse(
+                        v.ToString("F" + _o.VolumePrecision,
                             System.Globalization.CultureInfo.InvariantCulture),
                         System.Globalization.CultureInfo.InvariantCulture);
+
+                    if (splitCell)
+                    {
+                        // Каждая цифра — в центре своей части ячейки, чтобы
+                        // читалось, где насыпь, а где выемка.
+                        FindZeroLineAnchors(r, c, cosA, sinA, surf1!, surf2!,
+                            out double fLx, out double fLy,
+                            out double cLx, out double cLy);
+
+                        AddCenteredText(trans, _o.VolumeLayerName,
+                            LW(fLx, fLy, cosA, sinA),
+                            Signed(volFill, _o.VolumePrecision),
+                            vh, angle, aci, hideMask: _o.HideMaskVolume);
+                        AddCenteredText(trans, _o.VolumeLayerName,
+                            LW(cLx, cLy, cosA, sinA),
+                            Signed(volCut, _o.VolumePrecision),
+                            vh, angle, aci, hideMask: _o.HideMaskVolume);
+
+                        double dFill = Disp(volFill), dCut = Disp(Math.Abs(volCut));
+                        totFill += dFill; colFill[c] += dFill; rowFill[r] += dFill;
+                        totCut  += dCut;  colCut[c]  += dCut;  rowCut[r]  += dCut;
+                        continue;
+                    }
+
+                    // Объём — по центру ячейки; для обрезанных ячеек подбираем
+                    // ближайшую точку внутри клип-области, чтобы метка не
+                    // попала за пределы оставшейся после обрезки геометрии.
+                    double cx = x0 + _o.CellSizeX * 0.5;
+                    double cy = y0 + _o.CellSizeY * 0.5;
+                    FindInsideAnchor(x0, y0, _o.CellSizeX, _o.CellSizeY,
+                        cx, cy, cosA, sinA, surf1!, surf2!, out double vLx, out double vLy);
+                    AddCenteredText(trans, _o.VolumeLayerName,
+                        LW(vLx, vLy, cosA, sinA),
+                        Signed(vol, _o.VolumePrecision),
+                        vh, angle, aci, hideMask: _o.HideMaskVolume);
+
+                    double dispVol = Disp(absVol);
                     if (isCut) { totCut  += dispVol; colCut[c]  += dispVol; rowCut[r]  += dispVol; }
                     else       { totFill += dispVol; colFill[c] += dispVol; rowFill[r] += dispVol; }
                 }
@@ -343,7 +403,7 @@ namespace KartogrammaPlugin
 
                         double zcx = (z.x0 + z.x1) / 2.0, zcy = (z.y0 + z.y1) / 2.0;
                         FindInsideAnchor(z.x0, z.y0, z.x1 - z.x0, z.y1 - z.y0,
-                            zcx, zcy, cosA, sinA, out double zLx, out double zLy);
+                            zcx, zcy, cosA, sinA, surf1!, surf2!, out double zLx, out double zLy);
                         AddCenteredText(trans, _o.VolumeLayerName,
                             LW(zLx, zLy, cosA, sinA),
                             Signed(zVol, _o.VolumePrecision),
@@ -441,10 +501,16 @@ namespace KartogrammaPlugin
                       + EraseByLayer(trans, ms, _o.ExistLayerName)
                       + EraseByLayer(trans, ms, _o.DesignLayerName)
                       + EraseByLayer(trans, ms, _o.VolumeLayerName)
-                      + EraseByLayer(trans, ms, _o.TableLayerName);
+                      + EraseByLayer(trans, ms, _o.TableLayerName)
+                      // Штриховка выемки/насыпи и линия нулевых работ рисуются
+                      // вместе с объёмами (см. CalculateVolume → DrawHatchAndZeroLine)
+                      // по тем же ячейкам сетки — при удалении объёмов их тоже
+                      // нужно убрать, иначе штриховка остаётся висеть без данных.
+                      + EraseByLayer(trans, ms, _o.HatchLayerName)
+                      + EraseByLayer(trans, ms, _o.ZeroLineLayerName);
                 trans.Commit();
 
-                ed.WriteMessage($"\n[Картограмма] Удалено {n} объектов (отметки + объёмы).\n");
+                ed.WriteMessage($"\n[Картограмма] Удалено {n} объектов (отметки + объёмы + штриховка).\n");
             }
             catch (Exception ex)
             {
@@ -941,14 +1007,14 @@ namespace KartogrammaPlugin
             _innerPtsList = null;
             if (_o.AutoBounds) { UpdateBoundaryBbox(); return; }
 
-            _boundaryPts = GetBoundaryPoints(trans, _o.OuterBoundaryId);
+            _boundaryPts = GetBoundaryPoints(trans, _o.OuterBoundaryId, _doc.Editor, "наружная граница");
 
             if (_o.InnerBoundaryIds != null && _o.InnerBoundaryIds.Count > 0)
             {
                 _innerPtsList = new List<List<Point2d>>();
                 foreach (var innerId in _o.InnerBoundaryIds)
                 {
-                    var ipts = GetBoundaryPoints(trans, innerId);
+                    var ipts = GetBoundaryPoints(trans, innerId, _doc.Editor, "внутренняя граница");
                     if (ipts != null)
                         _innerPtsList.Add(ipts);
                 }
@@ -1316,7 +1382,8 @@ namespace KartogrammaPlugin
         //  бинарный поиск точки пересечения границы и считается частичный объём.
         // ═══════════════════════════════════════════════════════════════════════
         private double CalcCellVolumeAccurate(int r, int c,
-            CivilSurface s1, CivilSurface s2, double cosA, double sinA, out double cellArea)
+            CivilSurface s1, CivilSurface s2, double cosA, double sinA, out double cellArea,
+            out double volFill, out double volCut)
         {
             double szX = _o.CellSizeX;
             double szY = _o.CellSizeY;
@@ -1343,7 +1410,7 @@ namespace KartogrammaPlugin
 
                 // Точки вне допустимой области помечаются как NaN — CalcSubTriVol
                 // обрезает субтреугольники на краю через бинарный поиск
-                // (FindBoundaryPoint). IsInBounds сам учитывает DontClipCells:
+                // (FindBoundaryPoint). IsInBounds сам учитывает ClipCells:
                 // «обрезать» → клипать наружную границу и «дырки»;
                 // «не обрезать» → клипать только «дырки», наружная игнорируется.
                 // Зоны резких перепадов исключаются — их объём считается отдельно.
@@ -1356,6 +1423,8 @@ namespace KartogrammaPlugin
 
             double vol = 0.0;
             cellArea   = 0.0;
+            volFill    = 0.0;
+            volCut     = 0.0;
 
             for (int si = 0; si < n; si++)
             for (int sj = 0; sj < n; sj++)
@@ -1365,16 +1434,20 @@ namespace KartogrammaPlugin
                     wx[si,   sj  ], wy[si,   sj  ], h[si,   sj  ],
                     wx[si,   sj+1], wy[si,   sj+1], h[si,   sj+1],
                     wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ],
-                    out double aBL);
+                    out double aBL, out double fBL, out double cBL);
                 cellArea += aBL;
+                volFill  += fBL;
+                volCut   += cBL;
 
                 // Верхний правый треугольник: BR, TR, TL
                 vol += CalcSubTriVol(s1, s2,
                     wx[si,   sj+1], wy[si,   sj+1], h[si,   sj+1],
                     wx[si+1, sj+1], wy[si+1, sj+1], h[si+1, sj+1],
                     wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ],
-                    out double aTR);
+                    out double aTR, out double fTR, out double cTR);
                 cellArea += aTR;
+                volFill  += fTR;
+                volCut   += cTR;
             }
 
             return vol;
@@ -1387,24 +1460,35 @@ namespace KartogrammaPlugin
         //  без обрезки либо доля, попавшая в клип-область (оценка 20×20 сэмплов).
         // ═══════════════════════════════════════════════════════════════════════
         private double CalcCellVolumeSquares(int r, int c,
-            CivilSurface s1, CivilSurface s2, double cosA, double sinA)
+            CivilSurface s1, CivilSurface s2, double cosA, double sinA,
+            out double volFill, out double volCut)
         {
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            volFill = 0.0;
+            volCut  = 0.0;
 
-            // Рабочие отметки в 4 углах ячейки
+            // Рабочие отметки в 4 углах ячейки. Порядок обхода (00 → 01 → 11 → 10)
+            // нужен для разделения по нулевой линии — оно идёт по контуру клетки.
+            var hc = new double[4];
+            int[] cornerDx = { 0, 1, 1, 0 };
+            int[] cornerDy = { 0, 0, 1, 1 };
             double sum = 0.0;
             int    cnt = 0;
-            for (int dy = 0; dy <= 1; dy++)
-            for (int dx = 0; dx <= 1; dx++)
+            for (int k = 0; k < 4; k++)
             {
-                double lx = (c + dx) * szX;
-                double ly = (r + dy) * szY;
+                double lx = (c + cornerDx[k]) * szX;
+                double ly = (r + cornerDy[k]) * szY;
                 double wx = _o.BaseX + lx * cosA - ly * sinA;
                 double wy = _o.BaseY + lx * sinA + ly * cosA;
                 double? e1 = GetElevS(s1, wx, wy);
                 double? e2 = GetElevS(s2, wx, wy);
-                if (!e1.HasValue || !e2.HasValue || InAnomalyZoneW(wx, wy)) continue;
-                sum += e2.Value - e1.Value;
+                if (!e1.HasValue || !e2.HasValue || InAnomalyZoneW(wx, wy))
+                {
+                    hc[k] = double.NaN;
+                    continue;
+                }
+                hc[k] = e2.Value - e1.Value;
+                sum += hc[k];
                 cnt++;
             }
             if (cnt == 0) return 0.0;
@@ -1412,7 +1496,7 @@ namespace KartogrammaPlugin
 
             // Эффективная площадь с учётом обрезки
             double effArea;
-            if (_o.DontClipCells || (_boundaryPts == null && _innerPtsList == null))
+            if (!_o.ClipCells || (_boundaryPts == null && _innerPtsList == null))
             {
                 effArea = szX * szY;
             }
@@ -1432,7 +1516,27 @@ namespace KartogrammaPlugin
                 effArea = szX * szY * (double)inside / total;
             }
 
-            return effArea * hAvg;
+            double vol = effArea * hAvg;
+
+            // ── Нулевая линия внутри клетки ───────────────────────────────────
+            // Классический метод квадратов усредняет отметки по всей клетке, и
+            // для клеток, пересечённых нулевой линией, это неверно: насыпь и
+            // выемка взаимно гасятся. Такие клетки разделяем — так же, как это
+            // делается вручную: нулевая линия интерполируется по сторонам
+            // клетки, каждая часть получает свой объём.
+            // Разделяем только когда известны ВСЕ четыре угла: при неполных
+            // данных геометрия нулевой линии не определена, оставляем сальдо.
+            if (cnt == 4 && ZeroLineSplit.IsMixed(hc))
+            {
+                ZeroLineSplit.Quad(effArea, hc[0], hc[1], hc[2], hc[3],
+                    out volFill, out volCut, out _, out _);
+                return volFill + volCut;
+            }
+
+            // Однородная клетка — сальдо не меняется, оно же и есть объём
+            // своего знака.
+            if (vol >= 0) volFill = vol; else volCut = vol;
+            return vol;
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -1477,9 +1581,11 @@ namespace KartogrammaPlugin
             double xA, double yA, double hA,
             double xB, double yB, double hB,
             double xC, double yC, double hC,
-            out double area)
+            out double area, out double volFill, out double volCut)
         {
             area = 0.0;
+            volFill = 0.0;
+            volCut  = 0.0;
             bool aOk = !double.IsNaN(hA);
             bool bOk = !double.IsNaN(hB);
             bool cOk = !double.IsNaN(hC);
@@ -1493,6 +1599,10 @@ namespace KartogrammaPlugin
             if (valid == 3)
             {
                 area = fullArea;
+                // Разделение по нулевой линии — только для подписи и итогов;
+                // возвращаемое сальдо считается прежней формулой без изменений.
+                ZeroLineSplit.Triangle(fullArea, hA, hB, hC,
+                    out volFill, out volCut, out _, out _);
                 return fullArea * (hA + hB + hC) / 3.0;
             }
 
@@ -1515,6 +1625,14 @@ namespace KartogrammaPlugin
                 double a1 = TriArea2D(pX, pY, xV1, yV1, xV2, yV2);
                 double a2 = TriArea2D(pX, pY, xV2, yV2, qX, qY);
                 area = a1 + a2;
+
+                ZeroLineSplit.Triangle(a1, hP, hV1, hV2,
+                    out double f1, out double c1, out _, out _);
+                ZeroLineSplit.Triangle(a2, hP, hV2, hQ,
+                    out double f2, out double c2, out _, out _);
+                volFill = f1 + f2;
+                volCut  = c1 + c2;
+
                 return a1 * (hP + hV1 + hV2) / 3.0
                      + a2 * (hP + hV2 + hQ) / 3.0;
             }
@@ -1534,6 +1652,8 @@ namespace KartogrammaPlugin
 
                 // Валидная область: треугольник V-P-Q
                 area = TriArea2D(xV, yV, pX, pY, qX, qY);
+                ZeroLineSplit.Triangle(area, hV, hP, hQ,
+                    out volFill, out volCut, out _, out _);
                 return area * (hV + hP + hQ) / 3.0;
             }
 
@@ -1633,6 +1753,10 @@ namespace KartogrammaPlugin
         {
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
             int drawn = 0;
+            // Ячейки, которым требовалась обрезка по границе, но геометрическая
+            // операция не удалась (см. BuildClippedCellRegion) — такие ячейки
+            // просто пропускаются молча; считаем их, чтобы предупредить в конце.
+            int clipFailed = 0;
 
             // Загрузить внешнюю границу и внутренние «дырки». Все строятся как
             // свежие плоские полилинии в плоскости Z=0 c Normal=(0,0,1) —
@@ -1641,7 +1765,7 @@ namespace KartogrammaPlugin
             List<Point2d>? outerPts = null;
             if (!_o.AutoBounds)
             {
-                outerPts = GetBoundaryPoints(t, _o.OuterBoundaryId);
+                outerPts = GetBoundaryPoints(t, _o.OuterBoundaryId, _doc.Editor, "наружная граница");
                 if (outerPts != null)
                     outerProto = BuildFlatPolyline(outerPts);
             }
@@ -1652,7 +1776,7 @@ namespace KartogrammaPlugin
             {
                 foreach (var innerId in _o.InnerBoundaryIds)
                 {
-                    var ipts = GetBoundaryPoints(t, innerId);
+                    var ipts = GetBoundaryPoints(t, innerId, _doc.Editor, "внутренняя граница");
                     if (ipts != null)
                     {
                         innerProtos.Add(BuildFlatPolyline(ipts));
@@ -1663,6 +1787,16 @@ namespace KartogrammaPlugin
 
             bool hasManualBounds = (outerProto != null && outerPts != null) || innerProtos.Count > 0;
 
+            // Обрезаем по АВТОМАТИЧЕСКОЙ границе (фактическому краю зоны данных,
+            // где заданы обе поверхности) во всех случаях, когда нет пригодной
+            // ручной границы — не только когда включён флаг «Границы
+            // автоматически». Иначе при снятом флаге, но без выбранных внешней
+            // и внутренней границ, обрезать было попросту нечем, и «Обрезать
+            // квадраты» переставал что-либо делать. Это тот же критерий, по
+            // которому ячейка вообще попадает в сетку и считается её объём,
+            // поэтому обрезка ничего не меняет в расчётах — только в отрисовке.
+            bool autoClip = _o.ClipCells && !hasManualBounds;
+
             // Плотный досэмплинг тонких зон перекрытия (узкая траншея, которую
             // грубая 3×3 выборка пропускает). Включаем всегда при ручных границах,
             // а в авто-режиме — если сетка не гигантская (защита от лишней нагрузки
@@ -1672,6 +1806,11 @@ namespace KartogrammaPlugin
 
             for (int r = 0; r < rows; r++)
             {
+                // Обрезка по авто-границе семплирует поверхности в краевых
+                // ячейках — на крупных сетках это заметно, показываем прогресс.
+                if (autoClip && (r & 7) == 0)
+                    Report($"Построение сетки… {r}/{rows}", 2 + (int)(3.0 * r / Math.Max(rows, 1)));
+
                 for (int c = 0; c < cols; c++)
                 {
                     double x0 = c * szX, y0 = r * szY;
@@ -1719,9 +1858,9 @@ namespace KartogrammaPlugin
 
                     if (hasManualBounds)
                     {
-                        // Флаг DontClipCells управляет только тем, резать ли крайние
-                        // ячейки. Если флаг включён — Partial-ячейки рисуются целиком.
-                        bool needRegion = !_o.DontClipCells &&
+                        // Флаг ClipCells управляет только тем, резать ли крайние
+                        // ячейки. Если флаг снят — Partial-ячейки рисуются целиком.
+                        bool needRegion = _o.ClipCells &&
                                           ((outerCls == CellClass.Partial) || partialInners.Count > 0);
                         if (needRegion)
                         {
@@ -1735,10 +1874,35 @@ namespace KartogrammaPlugin
                                 t.AddNewlyCreatedDBObject(clippedRegion, true);
                                 drawn++;
                             }
+                            else
+                            {
+                                clipFailed++;
+                            }
                             continue;
                         }
                         // Fall through: целиком внутри outer без пересечений,
-                        // либо DontClipCells=true и ячейка только задета границей.
+                        // либо ClipCells=false и ячейка только задета границей.
+                    }
+
+                    if (autoClip)
+                    {
+                        var clipped = BuildAutoClippedCell(r, c, cA, sA, s1, s2);
+                        if (clipped != null)
+                        {
+                            foreach (var loop in clipped)
+                            {
+                                var cpl = new Polyline();
+                                for (int k = 0; k < loop.Count; k++)
+                                    cpl.AddVertexAt(k, loop[k], 0, 0, 0);
+                                cpl.Closed = true;
+                                cpl.Layer  = _o.GridLayerName;
+                                _ms.AppendEntity(cpl);
+                                t.AddNewlyCreatedDBObject(cpl, true);
+                            }
+                            drawn++;
+                            continue;
+                        }
+                        // null → ячейка целиком в зоне данных: обычный квадрат.
                     }
 
                     var pl = new Polyline();
@@ -1756,7 +1920,330 @@ namespace KartogrammaPlugin
 
             outerProto?.Dispose();
             foreach (var ip in innerProtos) ip.Dispose();
+
+            if (clipFailed > 0)
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] ВНИМАНИЕ: {clipFailed} краевых ячеек не удалось " +
+                    "обрезать по границе (см. сообщения об ошибке клиппинга выше) — " +
+                    "эти ячейки не нарисованы вовсе, а не оставлены целыми.");
+
             return drawn;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  ОБРЕЗКА ПО АВТОМАТИЧЕСКОЙ ГРАНИЦЕ (режим «Границы автоматически»)
+        //
+        //  «Автоматическая граница» — не полилиния на чертеже, а фактический
+        //  край зоны данных: контур области, где заданы ОБЕ поверхности.
+        //  Контур внутри ячейки строит CellClipper (marching squares + бисекция).
+        //
+        //  Обрезка ЧИСТО ВИЗУАЛЬНАЯ: объём (CalcCellVolumeAccurate /
+        //  CalcCellVolumeSquares), площадь (CalcCellEffectiveArea) и подписи
+        //  отметок (DrawNodeLabel) в авто-режиме считаются по наличию данных и
+        //  от флага «Не обрезать» не зависят — см. IsInBounds/IsInClipRegion.
+        // ═══════════════════════════════════════════════════════════════════════
+
+        /// <summary>Плотность выборки при обрезке по авто-границе. Чётная, чтобы
+        /// узлы грубой проверки перекрытия (доли 0 / 0.5 / 1) попадали в выборку:
+        /// ячейка, признанная «с данными», не должна оказаться пустой.</summary>
+        private int ClipSampleSteps()
+        {
+            int n = DenseOverlapSteps();
+            return (n % 2 == 0) ? n : n + 1;
+        }
+
+        /// <summary>
+        /// Контуры ячейки (r, c), обрезанной по краю зоны данных, в координатах UCS.
+        /// null — обрезать нечего: ячейка целиком в зоне данных (или контур
+        /// построить не удалось), рисуется обычный квадрат.
+        /// </summary>
+        private List<List<Point2d>>? BuildAutoClippedCell(int r, int c,
+            double cA, double sA, CivilSurface s1, CivilSurface s2)
+        {
+            double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            double x0 = c * szX, y0 = r * szY;
+
+            // Предикат «есть данные» в локальных координатах ячейки.
+            bool HasData(double lx, double ly)
+            {
+                double gx = x0 + lx, gy = y0 + ly;
+                double wx = _o.BaseX + gx * cA - gy * sA;
+                double wy = _o.BaseY + gx * sA + gy * cA;
+                return GetElevS(s1, wx, wy).HasValue && GetElevS(s2, wx, wy).HasValue;
+            }
+
+            // Быстрый отсев: ячеек в глубине зоны данных подавляющее большинство,
+            // и резать их не нужно. Грубая выборка 5×5 отсеивает их дёшево —
+            // плотная выборка тратится только на краевые ячейки. Ценой этого
+            // остаётся необрезанной ячейка, у которой край зоны срезает угол
+            // мельче четверти стороны; на глаз такой срез и так неразличим.
+            const int Coarse = 4;
+            bool allInside = true;
+            for (int i = 0; i <= Coarse && allInside; i++)
+            for (int j = 0; j <= Coarse && allInside; j++)
+                if (!HasData(j * szX / Coarse, i * szY / Coarse)) allInside = false;
+            if (allInside) return null;
+
+            var fill = CellClipper.Clip(szX, szY, ClipSampleSteps(), 12, HasData, out var loops);
+            if (fill != CellClipper.CellFill.Partial) return null;
+
+            var res = new List<List<Point2d>>(loops.Count);
+            foreach (var loop in loops)
+            {
+                var pts = new List<Point2d>(loop.Count);
+                foreach (var p in loop)
+                    pts.Add(ToUcs2d(LW(x0 + p.X, y0 + p.Y, cA, sA)));
+                res.Add(pts);
+            }
+            return res;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  ШТРИХОВКА ВЫЕМКИ/НАСЫПИ И ЛИНИЯ НУЛЕВЫХ РАБОТ
+        //
+        //  Область штриховки — там, где рабочая отметка нужного знака. Признак
+        //  тот же, по которому объём делится между насыпью и выемкой
+        //  (ZeroLineSplit), а границей служит та же нулевая линия
+        //  (ZeroContour) — картинка и цифры не расходятся по построению.
+        //
+        //  Штрихуется поячеечно: контур области внутри ячейки строит CellClipper.
+        //  Швов на границах квадратов не возникает — образец штриховки в AutoCAD
+        //  привязан к началу координат, а не к контуру, поэтому соседние
+        //  штриховки совпадают рисунком.
+        //
+        //  Ничего не вычисляет: объёмы, отметки и таблица уже посчитаны и от
+        //  штриховки не зависят.
+        // ═══════════════════════════════════════════════════════════════════════
+        private void DrawHatchAndZeroLine(Transaction t, int rows, int cols,
+            double cA, double sA, CivilSurface s1, CivilSurface s2)
+        {
+            bool wantFill = _o.HatchFill.Enabled;
+            bool wantCut  = _o.HatchCut.Enabled;
+            bool wantZero = _o.ZeroLine.Enabled;
+            if (!wantFill && !wantCut && !wantZero) return;
+
+            double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            int    steps = ClipSampleSteps();
+            var    ltId  = ResolveLinetype(t, _o.ZeroLine.LineType);
+            bool   errorReported = false;
+            int    hatches = 0, zeroChains = 0;
+
+            for (int r = 0; r < rows; r++)
+            {
+                if ((r & 3) == 0)
+                    Report($"Штриховка… {r}/{rows}", 5 + (int)(3.0 * r / Math.Max(rows, 1)));
+
+                for (int c = 0; c < cols; c++)
+                {
+                    // Ровно те же ячейки, что и в сетке.
+                    if (!IsCellDrawn(r, c, cA, sA)) continue;
+                    if (!CellHasOverlap(r, c, s1, s2, cA, sA) &&
+                        !CellHasOverlap(r, c, s1, s2, cA, sA, DenseOverlapSteps())) continue;
+
+                    double x0 = c * szX, y0 = r * szY;
+
+                    // Рабочая отметка в локальных координатах ячейки.
+                    // NaN — работ здесь нет: либо нет данных одной из
+                    // поверхностей, либо точка вне заданных границ.
+                    double H(double lx, double ly)
+                    {
+                        double gx = x0 + lx, gy = y0 + ly;
+                        double wx = _o.BaseX + gx * cA - gy * sA;
+                        double wy = _o.BaseY + gx * sA + gy * cA;
+                        if (!IsInClipRegion(wx, wy)) return double.NaN;
+                        double? e1 = GetElevS(s1, wx, wy);
+                        double? e2 = GetElevS(s2, wx, wy);
+                        if (!e1.HasValue || !e2.HasValue) return double.NaN;
+                        return e2.Value - e1.Value;
+                    }
+
+                    // Грубая разведка знаков — одна на обе штриховки и линию.
+                    // Ячейки целиком одного знака (их большинство) штрихуются
+                    // прямоугольником без плотной выборки.
+                    const int Coarse = 4;
+                    int nPos = 0, nNeg = 0, nNan = 0;
+                    for (int i = 0; i <= Coarse; i++)
+                    for (int j = 0; j <= Coarse; j++)
+                    {
+                        double h = H(j * szX / Coarse, i * szY / Coarse);
+                        if (double.IsNaN(h)) nNan++;
+                        else if (h > 0)      nPos++;
+                        else if (h < 0)      nNeg++;
+                    }
+
+                    if (wantFill && nPos > 0 &&
+                        DrawSignHatch(t, x0, y0, cA, sA, steps, H, true,
+                            nNeg == 0 && nNan == 0, _o.HatchFill, ref errorReported))
+                        hatches++;
+
+                    if (wantCut && nNeg > 0 &&
+                        DrawSignHatch(t, x0, y0, cA, sA, steps, H, false,
+                            nPos == 0 && nNan == 0, _o.HatchCut, ref errorReported))
+                        hatches++;
+
+                    if (wantZero && nPos > 0 && nNeg > 0)
+                    {
+                        foreach (var chain in ZeroContour.Trace(szX, szY, steps, H))
+                        {
+                            if (chain.Count < 2) continue;
+                            var pl = new Polyline();
+                            for (int k = 0; k < chain.Count; k++)
+                                pl.AddVertexAt(k,
+                                    ToUcs2d(LW(x0 + chain[k].X, y0 + chain[k].Y, cA, sA)),
+                                    0, 0, 0);
+                            pl.Layer = _o.ZeroLineLayerName;
+                            pl.Color = Color.FromColorIndex(
+                                ColorMethod.ByAci, (short)_o.ZeroLine.ColorAci);
+                            if (!ltId.IsNull) pl.LinetypeId = ltId;
+                            pl.LineWeight = ToLineWeight(_o.ZeroLine.LineWeight);
+                            _ms.AppendEntity(pl);
+                            t.AddNewlyCreatedDBObject(pl, true);
+                            zeroChains++;
+                        }
+                    }
+                }
+            }
+
+            _doc.Editor.WriteMessage(
+                $"\n[Картограмма] Штриховка: {hatches} контуров, линия нулевых работ: {zeroChains} сегментов");
+        }
+
+        /// <summary>
+        /// Заштриховать часть ячейки с рабочей отметкой заданного знака.
+        /// Возвращает true, если штриховка создана.
+        /// </summary>
+        private bool DrawSignHatch(Transaction t, double x0, double y0,
+            double cA, double sA, int steps, Func<double, double, double> h,
+            bool positive, bool wholeCell, HatchSpec spec, ref bool errorReported)
+        {
+            double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            var loops = new List<List<Point2d>>();
+
+            if (wholeCell)
+            {
+                loops.Add(new List<Point2d>
+                {
+                    ToUcs2d(LW(x0,       y0,       cA, sA)),
+                    ToUcs2d(LW(x0 + szX, y0,       cA, sA)),
+                    ToUcs2d(LW(x0 + szX, y0 + szY, cA, sA)),
+                    ToUcs2d(LW(x0,       y0 + szY, cA, sA)),
+                });
+            }
+            else
+            {
+                bool Pred(double lx, double ly)
+                {
+                    double v = h(lx, ly);
+                    if (double.IsNaN(v)) return false;
+                    return positive ? v > 0 : v < 0;
+                }
+
+                var fill = CellClipper.Clip(szX, szY, steps, 12, Pred, out var raw);
+                // Full здесь означает вырожденную сшивку (целую ячейку отсеяла
+                // грубая разведка выше) — штриховать наугад не станем.
+                if (fill != CellClipper.CellFill.Partial || raw.Count == 0) return false;
+
+                foreach (var loop in raw)
+                {
+                    var pts = new List<Point2d>(loop.Count);
+                    foreach (var p in loop)
+                        pts.Add(ToUcs2d(LW(x0 + p.X, y0 + p.Y, cA, sA)));
+                    loops.Add(pts);
+                }
+            }
+
+            return AddHatch(t, loops, spec, ref errorReported);
+        }
+
+        /// <summary>Создать объект штриховки AutoCAD по готовым контурам.</summary>
+        private bool AddHatch(Transaction t, List<List<Point2d>> loops,
+            HatchSpec spec, ref bool errorReported)
+        {
+            if (loops.Count == 0) return false;
+
+            Hatch? hat = null;
+            try
+            {
+                hat = new Hatch();
+                _ms.AppendEntity(hat);
+                t.AddNewlyCreatedDBObject(hat, true);
+
+                hat.SetDatabaseDefaults();
+                // Порядок важен: и масштаб, и угол вступают в силу только после
+                // ПОВТОРНОГО назначения образца — особенность API штриховки.
+                // Поэтому оба параметра выставляются ДО второго SetHatchPattern,
+                // иначе угол молча остаётся нулевым.
+                hat.SetHatchPattern(HatchPatternType.PreDefined, spec.Pattern);
+                hat.PatternScale = spec.Scale > 0 ? spec.Scale : 1.0;
+                // Угол отсчитывается вместе с поворотом картограммы: штриховка
+                // должна лежать по сетке, а не по мировым осям.
+                hat.PatternAngle = (spec.Angle + _o.RotationDegrees) * Math.PI / 180.0;
+                hat.SetHatchPattern(HatchPatternType.PreDefined, spec.Pattern);
+
+                hat.Layer = _o.HatchLayerName;
+                hat.Color = Color.FromColorIndex(ColorMethod.ByAci, (short)spec.ColorAci);
+                hat.Associative = false;
+
+                foreach (var loop in loops)
+                {
+                    if (loop.Count < 3) continue;
+                    var pts = new Point2dCollection();
+                    foreach (var p in loop) pts.Add(p);
+                    if (!loop[0].IsEqualTo(loop[loop.Count - 1])) pts.Add(loop[0]);
+
+                    var bulges = new DoubleCollection();
+                    for (int i = 0; i < pts.Count; i++) bulges.Add(0.0);
+
+                    hat.AppendLoop(HatchLoopTypes.Default, pts, bulges);
+                }
+
+                if (hat.NumberOfLoops == 0)
+                {
+                    hat.Erase();
+                    return false;
+                }
+
+                hat.EvaluateHatch(true);
+                return true;
+            }
+            catch (System.Exception ex)
+            {
+                if (!errorReported)
+                {
+                    _doc.Editor.WriteMessage(
+                        $"\n[Картограмма] Не удалось построить штриховку «{spec.Pattern}»: " +
+                        $"{ex.GetType().Name}: {ex.Message}");
+                    errorReported = true;
+                }
+                try { hat?.Erase(); } catch { }
+                return false;
+            }
+        }
+
+        /// <summary>ObjectId типа линий по имени; ObjectId.Null — оставить как есть.</summary>
+        private ObjectId ResolveLinetype(Transaction t, string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return ObjectId.Null;
+            try
+            {
+                var table = (LinetypeTable)t.GetObject(_db.LinetypeTableId, OpenMode.ForRead);
+                if (table.Has(name)) return table[name];
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] Тип линий «{name}» не загружен в чертёж — " +
+                    "линия нулевых работ будет сплошной.");
+            }
+            catch { }
+            return ObjectId.Null;
+        }
+
+        /// <summary>Миллиметры → перечисление весов линий AutoCAD.</summary>
+        private static LineWeight ToLineWeight(double mm)
+        {
+            if (mm < 0) return LineWeight.ByLayer;
+            int hundredths = (int)Math.Round(mm * 100.0);
+            foreach (LineWeight lw in Enum.GetValues(typeof(LineWeight)))
+                if ((int)lw == hundredths) return lw;
+            return LineWeight.ByLayer;
         }
 
         /// <summary>Построить плоскую замкнутую полилинию в WCS Z=0 из точек
@@ -2066,30 +2553,52 @@ namespace KartogrammaPlugin
         }
 
         /// <summary>
-        /// Подбирает якорь метки, гарантированно попадающий внутрь клип-области
-        /// (наружная граница минус внутренние «дырки»). Проверка чисто
-        /// геометрическая (IsInClipRegion) и работает в ОБОИХ режимах — даже в
-        /// «Не обрезать» цифра объёма не должна улетать за заданные границы
-        /// (у траншеи-рамки центр крупной ячейки часто в «дырке» или снаружи).
+        /// Подбирает якорь метки, гарантированно попадающий внутрь ВИДИМОЙ части
+        /// ячейки — той, что осталась после обрезки. Что считать видимой частью,
+        /// зависит от режима границ:
+        ///   • ручные границы — клип-область (наружная минус внутренние «дырки»).
+        ///     Проверка чисто геометрическая и работает в ОБОИХ режимах флага:
+        ///     даже в «Не обрезать» цифра объёма не должна улетать за заданные
+        ///     границы (у траншеи-рамки центр крупной ячейки часто в «дырке»);
+        ///   • нет ручной границы (авто-режим или просто ничего не выбрано) +
+        ///     «обрезать» — зона данных, то есть та же автоматическая граница,
+        ///     по которой обрезаны сами квадраты (см. BuildAutoClippedCell).
+        ///     Без этого цифра краевой ячейки оставалась бы в центре квадрата,
+        ///     снаружи обрезанного контура;
+        ///   • нет ручной границы + «не обрезать» — квадрат рисуется целиком,
+        ///     центр ячейки и так внутри геометрии, якорь не двигаем.
         /// Если исходная точка уже внутри — возвращает её. Иначе сэмплирует
         /// ячейку плотно (шаг как у DenseOverlapSteps — чтобы не промахнуться
         /// мимо узкой полосы траншеи) и ставит якорь в центроид попавших внутрь
         /// точек — цифра ложится по середине видимого куска ячейки, а не на его
         /// край. Если центроид сам вне области (L-образный кусок в углу рамки) —
         /// берётся ближайшая к нему внутренняя точка. Если внутренних точек нет —
-        /// исходная (fallback). В режиме без границ — всегда исходная.
+        /// исходная (fallback).
+        ///
+        /// Двигается только ПОЛОЖЕНИЕ подписи; значение объёма не затрагивается.
         /// </summary>
         private void FindInsideAnchor(
             double cellX0, double cellY0, double szX, double szY,
             double ancLx, double ancLy, double cA, double sA,
+            CivilSurface s1, CivilSurface s2,
             out double outLx, out double outLy)
         {
             outLx = ancLx; outLy = ancLy;
-            if (_boundaryPts == null && _innerPtsList == null) return;
+
+            bool manual   = _boundaryPts != null || _innerPtsList != null;
+            // Без ручной границы обрезаем по факту зоны данных независимо от
+            // флага «Границы автоматически» — см. пояснение у autoClip в
+            // DrawGridLines.
+            bool autoClip = !manual && _o.ClipCells;
+            if (!manual && !autoClip) return;
+
+            bool Visible(double wx, double wy) => manual
+                ? IsInClipRegion(wx, wy)
+                : GetElevS(s1, wx, wy).HasValue && GetElevS(s2, wx, wy).HasValue;
 
             double awx = _o.BaseX + ancLx * cA - ancLy * sA;
             double awy = _o.BaseY + ancLx * sA + ancLy * cA;
-            if (IsInClipRegion(awx, awy)) return;
+            if (Visible(awx, awy)) return;
 
             int n = Math.Max(7, DenseOverlapSteps());
             var inLx = new List<double>(n * n);
@@ -2101,7 +2610,7 @@ namespace KartogrammaPlugin
                 double ly = cellY0 + szY * (i + 0.5) / n;
                 double wx = _o.BaseX + lx * cA - ly * sA;
                 double wy = _o.BaseY + lx * sA + ly * cA;
-                if (!IsInClipRegion(wx, wy)) continue;
+                if (!Visible(wx, wy)) continue;
                 inLx.Add(lx); inLy.Add(ly);
             }
             if (inLx.Count == 0) return;               // fallback: исходная точка
@@ -2112,7 +2621,7 @@ namespace KartogrammaPlugin
 
             double cwx = _o.BaseX + cxL * cA - cyL * sA;
             double cwy = _o.BaseY + cxL * sA + cyL * cA;
-            if (IsInClipRegion(cwx, cwy))
+            if (Visible(cwx, cwy))
             {
                 outLx = cxL; outLy = cyL;
                 return;
@@ -2125,6 +2634,75 @@ namespace KartogrammaPlugin
                 double dx = inLx[k] - cxL, dy = inLy[k] - cyL;
                 double d2 = dx * dx + dy * dy;
                 if (d2 < best) { best = d2; outLx = inLx[k]; outLy = inLy[k]; }
+            }
+        }
+
+        /// <summary>
+        /// Якоря для ДВУХ подписей в ячейке, через которую проходит нулевая
+        /// линия: точка внутри насыпной части и точка внутри выемочной.
+        /// Ячейка сэмплируется, точки разделяются по знаку рабочей отметки,
+        /// якорем каждой части служит ближайшая к её центроиду точка этой же
+        /// части. Именно «ближайшая точка набора», а не сам центроид: у
+        /// серповидной части (изогнутая нулевая линия) центроид лежит по
+        /// другую сторону линии, и цифра ушла бы в чужую половину.
+        /// Пригодность точки проверяется так же, как у одиночной подписи
+        /// (FindInsideAnchor): цифра не должна выходить за заданные границы.
+        /// </summary>
+        private void FindZeroLineAnchors(int r, int c, double cA, double sA,
+            CivilSurface s1, CivilSurface s2,
+            out double fillLx, out double fillLy,
+            out double cutLx,  out double cutLy)
+        {
+            double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            double x0 = c * szX, y0 = r * szY;
+
+            // Запасной вариант — центр ячейки, если своих точек не нашлось.
+            fillLx = cutLx = x0 + szX * 0.5;
+            fillLy = cutLy = y0 + szY * 0.5;
+
+            int n = Math.Max(7, DenseOverlapSteps());
+            var fx = new List<double>(); var fy = new List<double>();
+            var cx = new List<double>(); var cy = new List<double>();
+
+            for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double lx = x0 + szX * (j + 0.5) / n;
+                double ly = y0 + szY * (i + 0.5) / n;
+                double wx = _o.BaseX + lx * cA - ly * sA;
+                double wy = _o.BaseY + lx * sA + ly * cA;
+
+                double? e1 = GetElevS(s1, wx, wy);
+                double? e2 = GetElevS(s2, wx, wy);
+                if (!e1.HasValue || !e2.HasValue) continue;
+                if (!IsInClipRegion(wx, wy) || InAnomalyZoneW(wx, wy)) continue;
+
+                double h = e2.Value - e1.Value;
+                if      (h > 0) { fx.Add(lx); fy.Add(ly); }
+                else if (h < 0) { cx.Add(lx); cy.Add(ly); }
+            }
+
+            PickPartAnchor(fx, fy, ref fillLx, ref fillLy);
+            PickPartAnchor(cx, cy, ref cutLx,  ref cutLy);
+        }
+
+        /// <summary>Якорь части: ближайшая к центроиду точка самого набора —
+        /// гарантированно лежит внутри своей части при любой её форме.</summary>
+        private static void PickPartAnchor(List<double> xs, List<double> ys,
+            ref double outX, ref double outY)
+        {
+            if (xs.Count == 0) return;
+
+            double sx = 0, sy = 0;
+            for (int k = 0; k < xs.Count; k++) { sx += xs[k]; sy += ys[k]; }
+            double gx = sx / xs.Count, gy = sy / ys.Count;
+
+            double best = double.MaxValue;
+            for (int k = 0; k < xs.Count; k++)
+            {
+                double dx = xs[k] - gx, dy = ys[k] - gy;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < best) { best = d2; outX = xs[k]; outY = ys[k]; }
             }
         }
 
@@ -2149,7 +2727,11 @@ namespace KartogrammaPlugin
             // даже если угол попал в «дырку» или за наружную — такому углу
             // отметка всё равно нужна. Критерий: узел отрисовывается, если
             // хотя бы одна из 4 смежных ячеек нарисована.
-            if (_o.DontClipCells)
+            // Условие про «дырку»/наружную осмысленно только при РУЧНЫХ границах.
+            // В авто-режиме клип-области нет, и узел отбирается ниже по наличию
+            // данных на обеих поверхностях — одинаково при любом положении флага
+            // «Обрезать квадраты»: он там управляет только отрисовкой квадратов.
+            if (!_o.ClipCells && !_o.AutoBounds)
             {
                 if (!IsAnyAdjacentCellDrawn(nr, nc, rows, cols, cA, sA)) return;
             }
@@ -3031,8 +3613,16 @@ namespace KartogrammaPlugin
         //  к первой точке, не замыкая флагом). Возвращает CCW-кольцо или null,
         //  если объект не поддерживается / не замкнут / вырожден.
         // ═══════════════════════════════════════════════════════════════════════
-        internal static List<Point2d>? GetBoundaryPoints(Transaction trans, ObjectId id)
+        /// <param name="ed">Если задан, диагностика отказа пишется в командную
+        /// строку — иначе граница отбрасывается молча, и обрезка квадратов по
+        /// ней просто перестаёт работать без единого объяснения почему.</param>
+        /// <param name="role">Как называть границу в сообщении: «наружная»/«внутренняя».</param>
+        internal static List<Point2d>? GetBoundaryPoints(Transaction trans, ObjectId id,
+            Editor? ed = null, string role = "граница")
         {
+            void Warn(string reason) =>
+                ed?.WriteMessage($"\n[Картограмма] {role}: {reason} — контур не используется, обрезка по нему не применяется.");
+
             if (id.IsNull) return null;
             var obj = trans.GetObject(id, OpenMode.ForRead);
 
@@ -3042,7 +3632,7 @@ namespace KartogrammaPlugin
             switch (obj)
             {
                 case Polyline pl:
-                    if (!IsClosedCurve(pl)) return null;
+                    if (!IsClosedCurve(pl)) { Warn("полилиния не замкнута"); return null; }
                     crv = pl;
                     // ВАЖНО: GetPoint3dAt возвращает координаты в WCS,
                     // а GetPoint2dAt — в OCS полилинии. Ячейки сетки строятся в WCS,
@@ -3052,7 +3642,7 @@ namespace KartogrammaPlugin
                     break;
 
                 case Polyline3d p3d:
-                    if (!IsClosedCurve(p3d)) return null;
+                    if (!IsClosedCurve(p3d)) { Warn("3D-полилиния не замкнута"); return null; }
                     crv = p3d;
                     foreach (ObjectId vId in p3d)
                     {
@@ -3062,7 +3652,7 @@ namespace KartogrammaPlugin
                     break;
 
                 case FeatureLine fl:
-                    if (!IsClosedCurve(fl)) return null;
+                    if (!IsClosedCurve(fl)) { Warn("характерная линия не замкнута"); return null; }
                     crv = fl;
                     // Все точки характерной линии (PI + точки отметок) по порядку
                     var col = fl.GetPoints(Autodesk.Civil.FeatureLinePointType.AllPoints);
@@ -3071,6 +3661,10 @@ namespace KartogrammaPlugin
                     break;
 
                 default:
+                    // Поддерживаются только Polyline/Polyline3d/FeatureLine — Circle,
+                    // Region, Spline, Civil-Parcel и т.п. молча игнорировались.
+                    Warn($"объект типа {obj.GetType().Name} не поддерживается " +
+                         "(нужна замкнутая полилиния или характерная линия)");
                     return null;
             }
             // Дублирующее замыкание и повторы вершин убираем ДО аппроксимации:
@@ -3083,7 +3677,7 @@ namespace KartogrammaPlugin
             while (anchors.Count > 1 &&
                    anchors[anchors.Count - 1].DistanceTo(anchors[0]) < 1e-6)
                 anchors.RemoveAt(anchors.Count - 1);
-            if (anchors.Count < 3) return null;
+            if (anchors.Count < 3) { Warn("меньше 3 вершин после очистки дублей"); return null; }
 
             // Дуговые сегменты (скругления характерных линий, бульжи полилиний)
             // аппроксимируем адаптивно: между опорными вершинами вставляем точки,
@@ -3097,7 +3691,7 @@ namespace KartogrammaPlugin
                 if (pts[i].GetDistanceTo(pts[i - 1]) < 1e-9) pts.RemoveAt(i);
             if (pts.Count > 1 && pts[pts.Count - 1].GetDistanceTo(pts[0]) < 1e-9)
                 pts.RemoveAt(pts.Count - 1);
-            if (pts.Count < 3) return null;
+            if (pts.Count < 3) { Warn("меньше 3 вершин после разворачивания дуг"); return null; }
 
             NormalizeCcw(pts);
             return pts;
@@ -3218,22 +3812,22 @@ namespace KartogrammaPlugin
         }
 
         /// <summary>
-        /// «Обрезать» (DontClipCells=false): клиппинг по наружной границе И по
+        /// «Обрезать» (ClipCells=true): клиппинг по наружной границе И по
         /// внутренним «дыркам» на уровне субузлов.
-        /// «Не обрезать» (DontClipCells=true): полигоны игнорируются; фильтрация
+        /// «Не обрезать» (ClipCells=false): полигоны игнорируются; фильтрация
         /// целиком выполняется в BuildCells по классу ячейки, а внутри ячейки
         /// считается полный объём (как в авто-режиме).
         /// </summary>
         private bool IsInBounds(double wx, double wy)
         {
-            if (_o.DontClipCells) return true;
+            if (!_o.ClipCells) return true;
             return IsInClipRegion(wx, wy);
         }
 
         /// <summary>
         /// Геометрическая принадлежность точки клип-области (внутри наружной
         /// границы и вне всех «дырок»). В отличие от IsInBounds, НЕ зависит от
-        /// DontClipCells — используется для отрисовки подписей и фильтрации
+        /// ClipCells — используется для отрисовки подписей и фильтрации
         /// ячеек вне зависимости от того, обрезаем ли мы геометрию.
         /// </summary>
         private bool IsInClipRegion(double wx, double wy)

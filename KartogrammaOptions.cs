@@ -20,12 +20,19 @@ namespace KartogrammaPlugin
         public string DesignSurfaceName   { get; set; } = "";
 
         // ── Сетка ───────────────────────────────────────────────────────────────
-        public double CellSizeX     { get; set; } = 1.0;
-        public double CellSizeY     { get; set; } = 1.0;
+        public double CellSizeX     { get; set; } = 5.0;
+        public double CellSizeY     { get; set; } = 5.0;
         public bool   AutoBasePoint { get; set; } = true;
         public double BaseX         { get; set; } = 0.0;
         public double BaseY         { get; set; } = 0.0;
-        public bool   DontClipCells { get; set; } = false;
+        /// <summary>
+        /// Обрезать крайние квадраты по границе. true — квадраты режутся по
+        /// контуру (при ручных границах — по выбранным, при автоматических —
+        /// по краю зоны данных поверхностей); false — рисуются целиком.
+        /// Опция ЧИСТО ВИЗУАЛЬНАЯ: объёмы, отметки и итоговая таблица от неё
+        /// не зависят.
+        /// </summary>
+        public bool   ClipCells     { get; set; } = true;
         // Режим раскладки сетки (точно по границе / целые квадраты в середине)
         // выбирается автоматически по заданным границам — см. CalcAutoGrid.
 
@@ -65,6 +72,14 @@ namespace KartogrammaPlugin
         /// <summary>Стиль текста для итоговой таблицы</summary>
         public string TableTextStyleName { get; set; } = "Standard";
 
+        // ── Штриховка и линия нулевых работ ─────────────────────────────────────
+        /// <summary>Штриховка выемки (рабочая отметка ниже нуля).</summary>
+        public HatchSpec    HatchCut  { get; set; } = new() { ColorAci = 1, Pattern = "ANSI31", Angle = 0,  Scale = 0.1 }; // 1 = красный
+        /// <summary>Штриховка насыпи (рабочая отметка выше нуля).</summary>
+        public HatchSpec    HatchFill { get; set; } = new() { ColorAci = 5, Pattern = "ANSI31", Angle = 90, Scale = 0.1 }; // 5 = синий
+        /// <summary>Линия нулевых работ — граница между насыпью и выемкой.</summary>
+        public ZeroLineStyle ZeroLine  { get; set; } = new() { ColorAci = 3, LineType = "Continuous", LineWeight = -1.0 }; // 3 = зелёный
+
         // ── Слои ────────────────────────────────────────────────────────────────
         public string GridLayerName   { get; set; } = "Картограмма сетка";
         public string TextLayerName   { get; set; } = "Картограмма текст";
@@ -73,6 +88,8 @@ namespace KartogrammaPlugin
         public string DesignLayerName { get; set; } = "Картограмма красная";
         public string VolumeLayerName { get; set; } = "Картограмма объём";
         public string TableLayerName  { get; set; } = "Картограмма таблица";
+        public string HatchLayerName  { get; set; } = "Картограмма штриховка";
+        public string ZeroLineLayerName { get; set; } = "Картограмма нулевая линия";
 
         // ── Объём / Вычисление ──────────────────────────────────────────────────
         public bool   DrawSummaryTable   { get; set; } = true;

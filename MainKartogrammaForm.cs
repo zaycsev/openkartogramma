@@ -24,7 +24,7 @@ namespace KartogrammaPlugin
         private CheckBox      chkAutoBase  = null!;
         private NumericUpDown nudSizeX     = null!;
         private NumericUpDown nudSizeY     = null!;
-        private CheckBox      chkDontClip   = null!;
+        private CheckBox      chkClip       = null!;
         private CheckBox      chkAutoBounds = null!;
         private Button        btnOuterBound = null!;
         private Button        btnInnerBound = null!;
@@ -43,13 +43,13 @@ namespace KartogrammaPlugin
         // ── Сессия (статика — живёт всё время работы AutoCAD) ───────────────────
         private static string?  _sSurf1, _sSurf2, _sStyle, _sVolStyle, _sTblStyle;
         private static int      _sSurfIdx1 = 0, _sSurfIdx2 = 1;
-        private static decimal  _sSizeX    = 1m,    _sSizeY      = 1m;
+        private static decimal  _sSizeX    = 5m,    _sSizeY      = 5m;   // сетка по умолчанию 5×5 м
         private static decimal  _sAngle    = 0m;
         private static int      _sAngType  = 0;       // 0=Свой, 1=Горизонтально
         private static decimal  _sHeight   = 0.15m,  _sVolHeight = 0.25m;
         private static int      _sPrecIdx  = 2,       _sVolPrecIdx = 2;
         private static int      _sDecIdx   = 0;
-        private static bool     _sDontClip = false,  _sHide = true;
+        private static bool     _sClip = true,  _sHide = true;
         private static bool     _sHideVol  = true;
         private static bool     _sHideTable = false;
         private static bool     _sMinVolChk = true;
@@ -62,6 +62,12 @@ namespace KartogrammaPlugin
         private static bool     _sBasePicked;
         private static double   _sSavedBaseX, _sSavedBaseY;
         private static bool     _sAutoBounds = true;
+        private static readonly HatchSpec    _sHatchCut  =
+            new() { ColorAci = 1, Pattern = "ANSI31", Angle = 0,  Scale = 0.1 }; // 1 = красный
+        private static readonly HatchSpec    _sHatchFill =
+            new() { ColorAci = 5, Pattern = "ANSI31", Angle = 90, Scale = 0.1 }; // 5 = синий
+        private static readonly ZeroLineStyle _sZeroLine  =
+            new() { ColorAci = 3, LineType = "Continuous", LineWeight = -1.0 }; // 3 = зелёный
         private static AcadObjectId _sOuterBoundaryId = AcadObjectId.Null;
         private static List<AcadObjectId> _sInnerBoundaryIds = new();
         private static bool     _sessionSaved;
@@ -81,6 +87,8 @@ namespace KartogrammaPlugin
         private static string _sLayDesign = "Картограмма красная";
         private static string _sLayVolume = "Картограмма объём";
         private static string _sLayTable  = "Картограмма таблица";
+        private static string _sLayHatch  = "Картограмма штриховка";
+        private static string _sLayZero   = "Картограмма нулевая линия";
 
         /// <summary>
         /// Текущие имена всех слоёв картограммы (с учётом пользовательских
@@ -91,7 +99,8 @@ namespace KartogrammaPlugin
         public static IEnumerable<string> CurrentLayerNames => new[]
         {
             _sLayGrid, _sLayText, _sLayWork,
-            _sLayExist, _sLayDesign, _sLayVolume, _sLayTable
+            _sLayExist, _sLayDesign, _sLayVolume, _sLayTable,
+            _sLayHatch, _sLayZero
         };
 
         // ── Отметки ─────────────────────────────────────────────────────────────
@@ -106,6 +115,17 @@ namespace KartogrammaPlugin
         private Panel         pnlDesign    = null!;
         private Panel         pnlWork      = null!;
         private Panel         pnlVolume    = null!;
+
+        // ── Штриховка ───────────────────────────────────────────────────────────
+        private CheckBox      chkHatchCut  = null!;
+        private CheckBox      chkHatchFill = null!;
+        private CheckBox      chkZeroLine  = null!;
+        private Panel         prvHatchCut  = null!;
+        private Panel         prvHatchFill = null!;
+        private Panel         prvZeroLine  = null!;
+        // Типы линий читаются из чертежа один раз: обращение к базе на каждую
+        // перерисовку окошка предпросмотра недопустимо.
+        private List<LinetypeInfo>? _linetypesCache;
 
         // ── Объёмы ──────────────────────────────────────────────────────────────
         private CheckBox      chkHideVol   = null!;
@@ -139,6 +159,10 @@ namespace KartogrammaPlugin
             _doc    = doc;
             _surfs  = surfs;
             _styles = styles;
+            // Палитра образцов обязана совпадать с той, которой пользуется сам
+            // чертёж: MEASUREMENT=1 → acadiso.pat, 0 → acad.pat. Иначе
+            // предпросмотр покажет одну густоту, а AutoCAD нарисует другую.
+            HatchPatternCatalog.Configure(IsMetricDrawing());
             EnsurePersistedLoaded();   // подтянуть сохранённые на диске настройки (1 раз за сессию)
             BuildUI(docName);
             if (_sessionSaved) RestoreSession();
@@ -235,7 +259,7 @@ namespace KartogrammaPlugin
 
             // Строка 2: По горизонт., м:  [nud] [>>]
             grpGrid.Controls.Add(Lbl("По горизонт., м:", S(10), S(42)));
-            nudSizeX = Nud(0.01m, 200m, 1m, 2, 0.5m);
+            nudSizeX = Nud(0.01m, 200m, 5m, 2, 0.5m);
             nudSizeX.Location = new Point(S(130), S(40)); nudSizeX.Size = new Size(S(70), S(22));
             grpGrid.Controls.Add(nudSizeX);
             var btnPickSizeX = new Button { Text = ">>", Location = new Point(S(324), S(40)), Size = new Size(S(32), S(22)) };
@@ -245,7 +269,7 @@ namespace KartogrammaPlugin
 
             // Строка 3: По вертикали, м:  [nud] [>>]
             grpGrid.Controls.Add(Lbl("По вертикали, м:", S(10), S(66)));
-            nudSizeY = Nud(0.01m, 200m, 1m, 2, 0.5m);
+            nudSizeY = Nud(0.01m, 200m, 5m, 2, 0.5m);
             nudSizeY.Location = new Point(S(130), S(64)); nudSizeY.Size = new Size(S(70), S(22));
             grpGrid.Controls.Add(nudSizeY);
             var btnPickSizeY = new Button { Text = ">>", Location = new Point(S(324), S(64)), Size = new Size(S(32), S(22)) };
@@ -303,14 +327,23 @@ namespace KartogrammaPlugin
             };
             chkAutoBounds.CheckedChanged += OnAutoBoundsChanged;
             grpBnd.Controls.Add(chkAutoBounds);
-            chkDontClip = new CheckBox
+            chkClip = new CheckBox
             {
-                Text     = "Не обрезать сетку квадратов",
+                Text     = "Обрезать квадраты",
+                Checked  = true,
                 Location = new Point(S(10), S(50)),
                 Size     = new Size(S(170), S(20)),
                 Font     = new Font("Segoe UI", 7.5f)
             };
-            grpBnd.Controls.Add(chkDontClip);
+            new ToolTip().SetToolTip(chkClip,
+                "Крайние квадраты режутся по границе.\n" +
+                "Работает в обоих режимах: с выбранными границами и с\n" +
+                "«Границы автоматически» (там обрезка идёт по краю зоны\n" +
+                "данных поверхностей).\n" +
+                "Снять галочку — крайние квадраты рисуются целиком.\n" +
+                "Влияет только на отрисовку сетки — объёмы, отметки и\n" +
+                "итоговая таблица не меняются.");
+            grpBnd.Controls.Add(chkClip);
             // Правая колонка — кнопки выбора границ
             lblOuterBound = new Label
             {
@@ -481,15 +514,35 @@ namespace KartogrammaPlugin
 
             Controls.Add(grpL);
 
-            // ── Цвет ───────────────────────────────────────────────────────
-            // Верх и низ Цвета = верх и низ Сетки квадратов
+            // ── Отметки (цвета) | Штриховка ────────────────────────────────
+            // Полоса делится ровно пополам: слева цвета подписей, справа —
+            // включение штриховки выемки/насыпи и линии нулевых работ.
+            // Верх и низ полосы = верх и низ Сетки квадратов.
             int grpColorH = gridBottom - gridTopL; // S(92), как у Сетки
             rightY = gridTopL;
-            var grpC = Grp("Цвет", rx, rightY, rw, grpColorH);
-            int colorX = (rw - S(250)) / 2; // центрируем 4 пары в рамке
-            AddColorRow2(grpC, "Красная",          ref pnlDesign!,   1, "Разница отметок", ref pnlWork!,    3, colorX, S(22));
-            AddColorRow2(grpC, "Чёрная",           ref pnlExisting!, 5, "Объём",           ref pnlVolume!,  7, colorX, S(52));
+            int halfGap = S(6);
+            int halfW   = (rw - halfGap) / 2;
+
+            var grpC = Grp("Отметки", rx, rightY, halfW, grpColorH);
+            int colorX = (halfW - S(166)) / 2; // центрируем 2×2 пары в рамке
+            // Строки сдвинуты на 4 вниз относительно исходных 22/52: у «Штриховки»
+            // справа три ряда (Выемка/Насыпь/Нулевая), и середина второго ряда
+            // цветов («Чёрная»/«Объём») должна попасть в середину просвета
+            // между рядами «Насыпь» и «Нулевая» — так обе колонки смотрятся
+            // симметрично на одной высоте.
+            AddColorRow2(grpC, "Красная", ref pnlDesign!,   1, "Разница", ref pnlWork!,   3, colorX, S(26));
+            AddColorRow2(grpC, "Чёрная",  ref pnlExisting!, 5, "Объём",   ref pnlVolume!, 7, colorX, S(56));
             Controls.Add(grpC);
+
+            BuildHatchBlock(rx + halfW + halfGap, rightY, halfW, grpColorH);
+
+            // Густота в окошках предпросмотра считается от размера ячейки —
+            // при его изменении окошки надо перерисовать.
+            nudSizeX.ValueChanged += (s, e) =>
+            {
+                prvHatchCut.Invalidate();
+                prvHatchFill.Invalidate();
+            };
 
             // ── Объёмы ─────────────────────────────────────────────────────
             // Верх Объёмов = верх Угла поворота (angTop)
@@ -807,16 +860,22 @@ namespace KartogrammaPlugin
         {
             using var dlg = new LayerSettingsForm(
                 _sLayGrid, _sLayExist, _sLayDesign, _sLayWork, _sLayVolume, _sLayTable, _sLayText,
+                _sLayHatch, _sLayZero,
                 ClientSize);
             if (dlg.ShowDialog(this) == DialogResult.OK)
             {
-                _sLayGrid   = dlg.GridLayer;
-                _sLayExist  = dlg.ExistLayer;
-                _sLayDesign = dlg.DesignLayer;
-                _sLayWork   = dlg.WorkLayer;
-                _sLayVolume = dlg.VolumeLayer;
-                _sLayTable  = dlg.TableLayer;
-                _sLayText   = dlg.TextLayer;
+                // Пустое поле — это не «слой без имени», а очищенная строка:
+                // оставляем прежнее имя, иначе объекты уедут в слой "".
+                if (dlg.HatchLayer.Length  > 0) _sLayHatch  = dlg.HatchLayer;
+                if (dlg.ZeroLayer.Length   > 0) _sLayZero   = dlg.ZeroLayer;
+                if (dlg.GridLayer.Length   > 0) _sLayGrid   = dlg.GridLayer;
+                if (dlg.ExistLayer.Length  > 0) _sLayExist  = dlg.ExistLayer;
+                if (dlg.DesignLayer.Length > 0) _sLayDesign = dlg.DesignLayer;
+                if (dlg.WorkLayer.Length   > 0) _sLayWork   = dlg.WorkLayer;
+                if (dlg.VolumeLayer.Length > 0) _sLayVolume = dlg.VolumeLayer;
+                if (dlg.TableLayer.Length  > 0) _sLayTable  = dlg.TableLayer;
+                if (dlg.TextLayer.Length   > 0) _sLayText   = dlg.TextLayer;
+                PersistSettings();   // имена слоёв должны пережить перезапуск
                 SetStatus("Имена слоёв обновлены.", Color.DarkGreen);
             }
         }
@@ -918,6 +977,13 @@ namespace KartogrammaPlugin
         //  Снапшоты настроек. Структурные поля влияют на ГЕОМЕТРИЮ или СОДЕРЖИМОЕ
         //  подписей (числа); косметические — только на ЦВЕТ/ВЫСОТУ/СТИЛЬ текста.
         // ────────────────────────────────────────────────────────────────────────
+        private static string HatchKey(HatchSpec h)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            return $"{h.Enabled}/{h.ColorAci}/{h.Pattern}/" +
+                   $"{h.Angle.ToString("R", inv)}/{h.Scale.ToString("R", inv)}";
+        }
+
         private static string SnapshotStruct(KartogrammaOptions o)
         {
             var inv = System.Globalization.CultureInfo.InvariantCulture;
@@ -930,7 +996,11 @@ namespace KartogrammaPlugin
                 D(o.RotationDegrees),
                 o.AutoBounds.ToString(), o.OuterBoundaryId.ToString(),
                 string.Join(",", o.InnerBoundaryIds),
-                o.DontClipCells.ToString(),
+                o.ClipCells.ToString(),
+                // Штриховка и нулевая линия — это геометрия, а не косметика:
+                // изменение требует полной перестройки картограммы.
+                HatchKey(o.HatchCut), HatchKey(o.HatchFill),
+                $"{o.ZeroLine.Enabled}/{o.ZeroLine.ColorAci}/{o.ZeroLine.LineType}/{D(o.ZeroLine.LineWeight)}",
                 o.TextPrecision.ToString(), o.DecimalSeparator,
                 o.VolumePrecision.ToString(),
                 D(o.MinVolume), D(o.VolumeNodeStep),
@@ -992,7 +1062,7 @@ namespace KartogrammaPlugin
             o.AutoBasePoint   = chkAutoBase.Checked;
             o.BaseX           = _baseX;
             o.BaseY           = _baseY;
-            o.DontClipCells   = chkDontClip.Checked;
+            o.ClipCells       = chkClip.Checked;
             o.AutoBounds      = chkAutoBounds.Checked;
             o.OuterBoundaryId = _outerBoundaryId;
             o.InnerBoundaryIds = new List<AcadObjectId>(_innerBoundaryIds);
@@ -1037,6 +1107,17 @@ namespace KartogrammaPlugin
             o.DesignLayerName = _sLayDesign;
             o.VolumeLayerName = _sLayVolume;
             o.TableLayerName  = _sLayTable;
+            o.HatchLayerName    = _sLayHatch;
+            o.ZeroLineLayerName = _sLayZero;
+
+            // Штриховка и линия нулевых работ: включённость — галочками главного
+            // окна, оформление — диалогом кисточки.
+            o.HatchCut  = _sHatchCut.Clone();
+            o.HatchFill = _sHatchFill.Clone();
+            o.ZeroLine  = _sZeroLine.Clone();
+            o.HatchCut.Enabled  = chkHatchCut.Checked;
+            o.HatchFill.Enabled = chkHatchFill.Checked;
+            o.ZeroLine.Enabled  = chkZeroLine.Checked;
 
             return o;
         }
@@ -1091,8 +1172,9 @@ namespace KartogrammaPlugin
             btnInnerBound.Enabled = manual;
             btnClearOuter.Enabled = manual;
             btnClearInner.Enabled = manual;
-            chkDontClip.Enabled   = manual;
-            if (!manual) chkDontClip.Checked = false;
+            // «Не обрезать» доступен в ОБОИХ режимах: при ручных границах он
+            // отключает обрезку по выбранным контурам, в авто-режиме — по
+            // автоматической границе (краю зоны данных поверхностей).
             // Надписи «Наружная» / «Внутренние» меняют цвет синхронно
             var lblColor = manual ? SystemColors.ControlText : SystemColors.GrayText;
             lblOuterBound.ForeColor = lblColor;
@@ -1171,8 +1253,11 @@ namespace KartogrammaPlugin
             _sSurfIdx2   = cmbSurf2.SelectedIndex;
             _sSizeX      = nudSizeX.Value;
             _sSizeY      = nudSizeY.Value;
-            _sDontClip   = chkDontClip.Checked;
+            _sClip       = chkClip.Checked;
             _sAutoBounds = chkAutoBounds.Checked;
+            _sHatchCut.Enabled  = chkHatchCut.Checked;
+            _sHatchFill.Enabled = chkHatchFill.Checked;
+            _sZeroLine.Enabled  = chkZeroLine.Checked;
             _sOuterBoundaryId = _outerBoundaryId;
             _sInnerBoundaryIds = new List<AcadObjectId>(_innerBoundaryIds);
             _sAngType    = chkHorizontal.Checked ? 1 : 0;
@@ -1217,8 +1302,14 @@ namespace KartogrammaPlugin
 
             nudSizeX.Value    = Clamp(_sSizeX,    nudSizeX.Minimum,    nudSizeX.Maximum);
             nudSizeY.Value    = Clamp(_sSizeY,    nudSizeY.Minimum,    nudSizeY.Maximum);
-            chkDontClip.Checked = _sDontClip;
+            chkClip.Checked = _sClip;
             chkAutoBounds.Checked = _sAutoBounds;
+            // Выемка/Насыпь/Нулевая восстанавливаются наравне с остальными
+            // настройками: состояние лежит в settings.ini и переживает как
+            // повторное открытие окна, так и перезапуск AutoCAD.
+            chkHatchCut.Checked  = _sHatchCut.Enabled;
+            chkHatchFill.Checked = _sHatchFill.Enabled;
+            chkZeroLine.Checked  = _sZeroLine.Enabled;
             _outerBoundaryId = _sOuterBoundaryId;
             if (!_outerBoundaryId.IsNull)
             {
@@ -1319,7 +1410,13 @@ namespace KartogrammaPlugin
                 _sSurfIdx2   = Int("SurfIdx2", _sSurfIdx2);
                 _sSizeX      = Dec("SizeX", _sSizeX);
                 _sSizeY      = Dec("SizeY", _sSizeY);
-                _sDontClip   = Bool("DontClip", _sDontClip);
+                // Ключ переименован: «Не обрезать» → «Обрезать», смысл
+                // инвертирован. Файлы, записанные прежними версиями, читаем по
+                // старому ключу с инверсией — у тех, кто отключал обрезку,
+                // галочка после обновления не перевернётся.
+                _sClip       = map.ContainsKey("Clip")
+                    ? Bool("Clip", _sClip)
+                    : !Bool("DontClip", !_sClip);
                 _sAutoBounds = Bool("AutoBounds", _sAutoBounds);
                 _sAngType    = Int("AngType", _sAngType);
                 _sAngle      = Dec("Angle", _sAngle);
@@ -1346,6 +1443,31 @@ namespace KartogrammaPlugin
                 _sMinVolChk  = Bool("MinVolChk", _sMinVolChk);
                 _sMinVol     = Dec("MinVol", _sMinVol);
 
+                void LoadHatch(string k, HatchSpec h)
+                {
+                    h.Enabled  = Bool(k + "On", h.Enabled);
+                    h.ColorAci = Int (k + "Col", h.ColorAci);
+                    h.Pattern  = Str (k + "Pat") ?? h.Pattern;
+                    h.Angle    = (double)Dec(k + "Ang", (decimal)h.Angle);
+                    h.Scale    = (double)Dec(k + "Scl", (decimal)h.Scale);
+                }
+                LoadHatch("HatchCut",  _sHatchCut);
+                LoadHatch("HatchFill", _sHatchFill);
+                _sZeroLine.Enabled    = Bool("ZeroOn",  _sZeroLine.Enabled);
+                _sZeroLine.ColorAci   = Int ("ZeroCol", _sZeroLine.ColorAci);
+                _sZeroLine.LineType   = Str ("ZeroLt")  ?? _sZeroLine.LineType;
+                _sZeroLine.LineWeight = (double)Dec("ZeroLw", (decimal)_sZeroLine.LineWeight);
+
+                _sLayGrid   = Str("LayGrid")   ?? _sLayGrid;
+                _sLayText   = Str("LayText")   ?? _sLayText;
+                _sLayWork   = Str("LayWork")   ?? _sLayWork;
+                _sLayExist  = Str("LayExist")  ?? _sLayExist;
+                _sLayDesign = Str("LayDesign") ?? _sLayDesign;
+                _sLayVolume = Str("LayVolume") ?? _sLayVolume;
+                _sLayTable  = Str("LayTable")  ?? _sLayTable;
+                _sLayHatch  = Str("LayHatch")  ?? _sLayHatch;
+                _sLayZero   = Str("LayZero")   ?? _sLayZero;
+
                 _sessionSaved = true;   // есть сохранённые настройки → применяем их при открытии
             }
             catch { /* повреждённый файл игнорируем — останутся значения по умолчанию */ }
@@ -1368,7 +1490,7 @@ namespace KartogrammaPlugin
                 PI("SurfIdx2", _sSurfIdx2);
                 PD("SizeX", _sSizeX);
                 PD("SizeY", _sSizeY);
-                PB("DontClip", _sDontClip);
+                PB("Clip", _sClip);
                 PB("AutoBounds", _sAutoBounds);
                 PI("AngType", _sAngType);
                 PD("Angle", _sAngle);
@@ -1394,6 +1516,31 @@ namespace KartogrammaPlugin
                 PI("VolMethodIdx", _sVolMethodIdx);
                 PB("MinVolChk", _sMinVolChk);
                 PD("MinVol", _sMinVol);
+
+                void SaveHatch(string k, HatchSpec h)
+                {
+                    PB(k + "On",  h.Enabled);
+                    PI(k + "Col", h.ColorAci);
+                    P (k + "Pat", h.Pattern);
+                    PD(k + "Ang", (decimal)h.Angle);
+                    PD(k + "Scl", (decimal)h.Scale);
+                }
+                SaveHatch("HatchCut",  _sHatchCut);
+                SaveHatch("HatchFill", _sHatchFill);
+                PB("ZeroOn",  _sZeroLine.Enabled);
+                PI("ZeroCol", _sZeroLine.ColorAci);
+                P ("ZeroLt",  _sZeroLine.LineType);
+                PD("ZeroLw", (decimal)_sZeroLine.LineWeight);
+
+                P("LayGrid",   _sLayGrid);
+                P("LayText",   _sLayText);
+                P("LayWork",   _sLayWork);
+                P("LayExist",  _sLayExist);
+                P("LayDesign", _sLayDesign);
+                P("LayVolume", _sLayVolume);
+                P("LayTable",  _sLayTable);
+                P("LayHatch",  _sLayHatch);
+                P("LayZero",   _sLayZero);
 
                 System.IO.Directory.CreateDirectory(
                     System.IO.Path.GetDirectoryName(_settingsFile)!);
@@ -1438,26 +1585,249 @@ namespace KartogrammaPlugin
         }
 
         // Двухколоночная строка цвета
+        /// <summary>Ряд из двух пар «подпись + цвет». Компоновка плотная: раздел
+        /// занимает половину ширины колонки, вторую половину забрала Штриховка.</summary>
         private void AddColorRow2(GroupBox grp,
             string lbl1, ref Panel pnl1, int aci1,
             string lbl2, ref Panel pnl2, int aci2,
             int x, int rowY)
         {
-            grp.Controls.Add(Lbl(lbl1, x, rowY + S(4)));
+            var f = new Font("Segoe UI", 7.5f);
+
+            Label Small(string t, int lx) => new Label
+            {
+                Text = t, Location = new Point(lx, rowY + S(5)),
+                Size = new Size(S(46), S(14)), Font = f, AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+
+            grp.Controls.Add(Small(lbl1, x));
             pnl1          = ColorPanelNew(AciColorPickerForm.AciToColor(aci1));
-            pnl1.Location = new Point(x + S(62), rowY);
+            pnl1.Location = new Point(x + S(50), rowY);
             pnl1.Tag      = aci1;
             pnl1.Click   += OnColorClick;
             grp.Controls.Add(pnl1);
 
-            // Вторая пара (Разница отметок / Объём) — плотно к первой:
-            // подпись сразу после первой цветовой панели, затем её цвет-панель.
-            grp.Controls.Add(Lbl(lbl2, x + S(104), rowY + S(4)));
+            grp.Controls.Add(Small(lbl2, x + S(86)));
             pnl2          = ColorPanelNew(AciColorPickerForm.AciToColor(aci2));
-            pnl2.Location = new Point(x + S(220), rowY);
+            pnl2.Location = new Point(x + S(136), rowY);
             pnl2.Tag      = aci2;
             pnl2.Click   += OnColorClick;
             grp.Controls.Add(pnl2);
+        }
+
+        // ════════════════════════════════════════════════════════════════════════
+        //  Раздел «Штриховка» — правая половина полосы рядом с «Отметками».
+        //  Три переключателя с окошками предпросмотра. Настройки всех трёх
+        //  режимов открываются кликом по любому из окошек — отдельная кнопка
+        //  не нужна, само окошко и есть образец, по которому туда идут.
+        // ════════════════════════════════════════════════════════════════════════
+        private void BuildHatchBlock(int x, int y, int w, int h)
+        {
+            var grp = Grp("Штриховка", x, y, w, h);
+            var f   = new Font("Segoe UI", 7.5f);
+
+            int chkW = S(64), prvW = S(50), prvH = S(17), gap = S(6);
+            // Пары «переключатель + окошко» ставим по центру раздела.
+            int chkX = (w - (chkW + gap + prvW)) / 2;
+            int prvX = chkX + chkW + gap;
+
+            const string openTip =
+                "Открыть настройки штриховки и линии нулевых работ:\n" +
+                "образец, цвет, угол и масштаб штриховок,\n" +
+                "цвет, тип и вес линии нулевых работ";
+
+            CheckBox Row(string text, int rowY, string tip, out Panel preview)
+            {
+                var chk = new CheckBox
+                {
+                    Text     = text,
+                    Location = new Point(chkX, rowY),
+                    Size     = new Size(chkW, S(18)),
+                    Font     = f
+                };
+                new ToolTip().SetToolTip(chk, tip);
+                grp.Controls.Add(chk);
+
+                preview = new Panel
+                {
+                    Location    = new Point(prvX, rowY),
+                    Size        = new Size(prvW, prvH),
+                    BackColor   = Color.White,
+                    BorderStyle = BorderStyle.FixedSingle,
+                    Cursor      = Cursors.Hand
+                };
+                new ToolTip().SetToolTip(preview, openTip);
+                preview.Click += OnHatchSettings;
+                grp.Controls.Add(preview);
+                return chk;
+            }
+
+            chkHatchCut = Row("Выемка", S(20),
+                "Штриховать участки выемки (рабочая отметка ниже нуля)",
+                out prvHatchCut!);
+            chkHatchCut.CheckedChanged += (s, e) => _sHatchCut.Enabled = chkHatchCut.Checked;
+            prvHatchCut.Paint += (s, e) => PaintHatchPreview((Panel)s!, e, _sHatchCut);
+
+            chkHatchFill = Row("Насыпь", S(44),
+                "Штриховать участки насыпи (рабочая отметка выше нуля)",
+                out prvHatchFill!);
+            chkHatchFill.CheckedChanged += (s, e) => _sHatchFill.Enabled = chkHatchFill.Checked;
+            prvHatchFill.Paint += (s, e) => PaintHatchPreview((Panel)s!, e, _sHatchFill);
+
+            chkZeroLine = Row("Нулевая", S(68),
+                "Рисовать линию нулевых работ — границу насыпи и выемки",
+                out prvZeroLine!);
+            chkZeroLine.CheckedChanged += (s, e) => _sZeroLine.Enabled = chkZeroLine.Checked;
+            prvZeroLine.Paint += PaintZeroLinePreview;
+
+            Controls.Add(grp);
+        }
+
+        private void PaintHatchPreview(Panel p, PaintEventArgs e, HatchSpec st)
+        {
+            var g = e.Graphics;
+            g.Clear(Color.White);
+            // Именно клиентский прямоугольник, а не e.ClipRectangle: при частичной
+            // перерисовке тот меньше панели, и образец обрезался бы по нему.
+            var box = new Rectangle(0, 0, p.ClientSize.Width, p.ClientSize.Height);
+            if (box.Width <= 0 || box.Height <= 0) return;
+            HatchPatternCatalog.Paint(g, box, st.Pattern, st.Angle, st.Scale,
+                AciColorPickerForm.AciToColor(st.ColorAci), PreviewPixelsPerUnit(box.Width));
+        }
+
+        /// <summary>
+        /// Сколько пикселей приходится на единицу чертежа в окошке предпросмотра.
+        /// Окошко показывает ровно ОДНУ ячейку сетки по ширине — тогда густота
+        /// в окошке совпадает с густотой на чертеже, и сплошная заливка вместо
+        /// штриховки видна ещё до построения картограммы.
+        /// </summary>
+        private double PreviewPixelsPerUnit(int boxWidthPx)
+        {
+            double cell = (double)nudSizeX.Value;
+            if (cell <= 1e-6) cell = 1.0;
+            return boxWidthPx / cell;
+        }
+
+        /// <summary>Метрический ли чертёж: MEASUREMENT=1 → acadiso.pat.</summary>
+        private static bool IsMetricDrawing()
+        {
+            try
+            {
+                var v = AcApp.GetSystemVariable("MEASUREMENT");
+                return Convert.ToInt32(v) != 0;
+            }
+            catch { return true; }   // по умолчанию метрика — картограмма в метрах
+        }
+
+        private void PaintZeroLinePreview(object? sender, PaintEventArgs e)
+        {
+            var p = (Panel)sender!;
+            var g = e.Graphics;
+            g.Clear(Color.White);
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            float wpx = _sZeroLine.LineWeight < 0
+                ? 1f : Math.Max(1f, (float)(_sZeroLine.LineWeight * 3.0));
+            using var pen = new Pen(AciColorPickerForm.AciToColor(_sZeroLine.ColorAci), wpx);
+
+            var dashes = FindLinetypeDashes(_sZeroLine.LineType);
+            if (dashes.Length > 0)
+            {
+                var pat = new List<float>();
+                foreach (var d in dashes)
+                {
+                    double len = Math.Abs(d) * 6.0;
+                    pat.Add((float)Math.Max(0.5, len));
+                }
+                if (pat.Count % 2 != 0) pat.Add(pat[pat.Count - 1]);
+                try
+                {
+                    pen.DashStyle   = System.Drawing.Drawing2D.DashStyle.Custom;
+                    pen.DashPattern = pat.ToArray();
+                }
+                catch { pen.DashStyle = System.Drawing.Drawing2D.DashStyle.Solid; }
+            }
+
+            int cy = p.ClientSize.Height / 2;
+            g.DrawLine(pen, S(3), cy, p.ClientSize.Width - S(3), cy);
+        }
+
+        private double[] FindLinetypeDashes(string name)
+        {
+            foreach (var lt in CollectLinetypes())
+                if (string.Equals(lt.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return lt.Dashes;
+            return Array.Empty<double>();
+        }
+
+        /// <summary>Типы линий, загруженные в чертёж, вместе со штриховым
+        /// рисунком — окно настроек показывает по нему настоящий предпросмотр,
+        /// а не догадку по имени. Читается один раз за жизнь окна.</summary>
+        private List<LinetypeInfo> CollectLinetypes()
+        {
+            if (_linetypesCache != null) return _linetypesCache;
+
+            var res = new List<LinetypeInfo>();
+            try
+            {
+                var db = _doc.Database;
+                using var tr = db.TransactionManager.StartTransaction();
+                var table = (Autodesk.AutoCAD.DatabaseServices.LinetypeTable)
+                    tr.GetObject(db.LinetypeTableId,
+                        Autodesk.AutoCAD.DatabaseServices.OpenMode.ForRead);
+
+                foreach (AcadObjectId id in table)
+                {
+                    var rec = (Autodesk.AutoCAD.DatabaseServices.LinetypeTableRecord)
+                        tr.GetObject(id, Autodesk.AutoCAD.DatabaseServices.OpenMode.ForRead);
+
+                    var dashes = new double[Math.Max(0, rec.NumDashes)];
+                    for (int i = 0; i < dashes.Length; i++)
+                    {
+                        try { dashes[i] = rec.DashLengthAt(i); } catch { dashes[i] = 0; }
+                    }
+                    res.Add(new LinetypeInfo { Name = rec.Name, Dashes = dashes });
+                }
+                tr.Commit();
+            }
+            catch { /* нет доступа к таблице — останется хотя бы Continuous */ }
+
+            if (res.Count == 0) res.Add(new LinetypeInfo());
+            res.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            _linetypesCache = res;
+            return res;
+        }
+
+        /// <summary>Кисточка — диалог настройки штриховок и линии нулевых работ.</summary>
+        private void OnHatchSettings(object? sender, EventArgs e)
+        {
+            using var dlg = new HatchSettingsForm(
+                _sHatchCut, _sHatchFill, _sZeroLine, CollectLinetypes(),
+                (double)nudSizeX.Value, ClientSize);
+
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            CopyHatch(dlg.CutStyle,  _sHatchCut);
+            CopyHatch(dlg.FillStyle, _sHatchFill);
+            _sZeroLine.ColorAci   = dlg.ZeroStyle.ColorAci;
+            _sZeroLine.LineType   = dlg.ZeroStyle.LineType;
+            _sZeroLine.LineWeight = dlg.ZeroStyle.LineWeight;
+
+            prvHatchCut.Invalidate();
+            prvHatchFill.Invalidate();
+            prvZeroLine.Invalidate();
+            PersistSettings();
+        }
+
+        /// <summary>Перенести оформление, не трогая включённость: галочками
+        /// управляет главное окно, диалог отвечает только за вид.</summary>
+        private static void CopyHatch(HatchSpec from, HatchSpec to)
+        {
+            to.ColorAci = from.ColorAci;
+            to.Pattern  = from.Pattern;
+            to.Angle    = from.Angle;
+            to.Scale    = from.Scale;
         }
 
         private void AddActBtn(string text, int x, int y, int w, int h, EventHandler handler, string? tooltip = null)

@@ -22,6 +22,10 @@ namespace KartogrammaPlugin
     /// </summary>
     internal static class CellClipper
     {
+        /// <summary>Итераций бисекции точки края: шаг выборки 5 см / 2^20 ≈
+        /// 0.05 мкм. Общая для штриховки и линии нулевых работ.</summary>
+        internal const int EdgeRefineSteps = 20;
+
         internal enum CellFill
         {
             /// <summary>Данных в ячейке нет — рисовать нечего.</summary>
@@ -45,7 +49,8 @@ namespace KartogrammaPlugin
         internal static CellFill Clip(
             double szX, double szY, int steps, int refineSteps,
             Func<double, double, bool> hasData,
-            out List<List<(double X, double Y)>> loops)
+            out List<List<(double X, double Y)>> loops,
+            double exactTol = 0)
         {
             loops = new List<List<(double X, double Y)>>();
 
@@ -90,6 +95,9 @@ namespace KartogrammaPlugin
             var pos  = new Dictionary<long, (double X, double Y)>();
             var next = new Dictionary<long, long>();
             bool bad = false;
+            // Начала отрезков самого контура (не кромки ячейки) — их уточняем
+            var contour = new HashSet<long>();
+            bool ringPhase = false;
 
             void Seg(long ka, (double X, double Y) pa, long kb, (double X, double Y) pb)
             {
@@ -97,6 +105,7 @@ namespace KartogrammaPlugin
                 pos[kb] = pb;
                 if (next.ContainsKey(ka)) { bad = true; return; }
                 next[ka] = kb;
+                if (!ringPhase) contour.Add(ka);
             }
 
             // Направление отрезков выбрано так, чтобы зона данных всегда была
@@ -133,9 +142,11 @@ namespace KartogrammaPlugin
                     case 7:  Seg(kT, pT, kL, pL); break;  // снаружи только tl
                     // Седловые случаи: диагональные пары. Что с чем соединять,
                     // решает проба в центре квадратика.
+                    // Связная полоса bl–tr отсекает снаружи углы br (B→R, как
+                    // case 13) и tl (T→L, как case 7).
                     case 5:
                         if (hasData((j + 0.5) * dx, (i + 0.5) * dy))
-                             { Seg(kR, pR, kB, pB); Seg(kT, pT, kL, pL); }
+                             { Seg(kB, pB, kR, pR); Seg(kT, pT, kL, pL); }
                         else { Seg(kB, pB, kL, pL); Seg(kT, pT, kR, pR); }
                         break;
                     case 10:
@@ -150,6 +161,7 @@ namespace KartogrammaPlugin
             // Обход против часовой стрелки (низ → право → верх → лево): при
             // таком направлении нутро ячейки тоже остаётся слева, и кромочные
             // отрезки стыкуются с отрезками контура в общих точках.
+            ringPhase = true;
             var ring = new List<(int I, int J)>(4 * n);
             for (int j = 0; j < n; j++) ring.Add((0, j));
             for (int i = 0; i < n; i++) ring.Add((i, n));
@@ -187,7 +199,11 @@ namespace KartogrammaPlugin
             // ── Стыковка отрезков в замкнутые контуры ─────────────────────────
             // У корректной конфигурации каждый ключ имеет ровно один вход и один
             // выход, поэтому обход от любой непосещённой вершины даёт цикл.
-            double simplifyTol = Math.Min(Math.Min(szX, szY) * 1e-3, 1e-3);
+            // 1 мкм — как у линии нулевых работ (ZeroContour.Simplify): убираются
+            // только точки на прямой, край штриховки не срезает изломы TIN. Не
+            // меньше остатка бисекции — иначе её «шум» сойдёт за излом.
+            double simplifyTol = Math.Max(1e-6,
+                2.0 * Math.Max(dx, dy) / Math.Pow(2, Math.Max(refineSteps, 0)));
             double minArea     = szX * szY * 1e-6;
 
             if (!bad)
@@ -205,6 +221,10 @@ namespace KartogrammaPlugin
                         if (!visited.Add(cur)) break;
                         loop.Add(pos[cur]);
                         if (!next.TryGetValue(cur, out long nx)) { bad = true; break; }
+                        if (exactTol > 0 && contour.Contains(cur))
+                            RefineBoundary((x, y) => hasData(x, y) ? 1 : -1,
+                                pos[cur], pos[nx], exactTol, szX, szY, loop,
+                                reach: Math.Sqrt(dx * dx + dy * dy));
                         cur = nx;
                         if (cur == startKey) break;
                     }
@@ -226,6 +246,75 @@ namespace KartogrammaPlugin
             }
 
             return CellFill.Partial;
+        }
+
+        // ── Точный край между узлами выборки ──────────────────────────────────
+
+        /// <summary>
+        /// Вставить в <paramref name="outPts"/> точки истинного края между
+        /// соседними точками контура p и q (сами p и q не добавляются).
+        /// Между узлами выборки край — не прямая: на TIN он ломается на каждом
+        /// ребре треугольника любой из поверхностей. Через середину хорды pq
+        /// по нормали ищется точка смены стороны (бисекция по реальной
+        /// отметке); если она дальше tol от хорды — это излом, он вставляется,
+        /// и обе половины уточняются так же. Итог — ломаная, отстоящая от
+        /// истинного края не больше чем на tol.
+        /// </summary>
+        /// <param name="side">+1 / −1 — по разные стороны края; 0 — неизвестно
+        /// (нет данных): уточнение в этом месте прекращается, остаётся хорда.</param>
+        internal static void RefineBoundary(Func<double, double, int> side,
+            (double X, double Y) p, (double X, double Y) q, double tol,
+            double szX, double szY, List<(double X, double Y)> outPts, int depth = 24,
+            double reach = 0)
+        {
+            if (depth <= 0) return;
+            double ex = q.X - p.X, ey = q.Y - p.Y;
+            double len = Math.Sqrt(ex * ex + ey * ey);
+            if (len <= tol) return;
+            double nx = -ey / len, ny = ex / len;
+            double far = Math.Max(len, reach);
+            double mx = (p.X + q.X) * 0.5, my = (p.Y + q.Y) * 0.5;
+
+            (double X, double Y) At(double t) =>
+                (Math.Min(Math.Max(mx + nx * t, 0), szX), Math.Min(Math.Max(my + ny * t, 0), szY));
+
+            int sM = side(mx, my);
+            if (sM == 0) return;
+
+            // Ближайшая по нормали точка другой стороны: край не отходит от
+            // хорды дальше её длины (хорда — внутри квадратика выборки).
+            double tFar = double.NaN;
+            for (double t = len / 16; double.IsNaN(tFar); t *= 2)
+            {
+                double tc = Math.Min(t, far);
+                foreach (double tt in new[] { tc, -tc })
+                {
+                    var a = At(tt);
+                    int s = side(a.X, a.Y);
+                    if (s == 0) return;
+                    if (s != sM) { tFar = tt; break; }
+                }
+                if (tc >= far) break;
+            }
+            if (double.IsNaN(tFar)) return;   // край на хорде (в пределах выборки)
+
+            double t0 = 0, t1 = tFar;          // side(t0) = sM, side(t1) ≠ sM
+            for (int k = 0; k < 48 && Math.Abs(t1 - t0) > tol * 1e-3; k++)
+            {
+                double tm = (t0 + t1) * 0.5;
+                var m = At(tm);
+                int s = side(m.X, m.Y);
+                if (s == 0) return;
+                if (s == sM) t0 = tm; else t1 = tm;
+            }
+            var r = At((t0 + t1) * 0.5);
+
+            double dist = Math.Abs((r.X - p.X) * ey - (r.Y - p.Y) * ex) / len;
+            if (dist <= tol) return;
+
+            RefineBoundary(side, p, r, tol, szX, szY, outPts, depth - 1, reach);
+            outPts.Add(r);
+            RefineBoundary(side, r, q, tol, szX, szY, outPts, depth - 1, reach);
         }
 
         // ── Бисекция до края зоны данных ──────────────────────────────────────

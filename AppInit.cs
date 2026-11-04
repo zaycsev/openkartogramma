@@ -79,6 +79,10 @@ namespace KartogrammaPlugin
                 }
 
                 Application.SystemVariableChanged += OnSysVarChanged;
+                // CUI/QUICKCUI тоже перестраивают ленту — ловим конец команды
+                Application.DocumentManager.DocumentCreated += OnDocumentCreated;
+                foreach (Document d in Application.DocumentManager)
+                    d.CommandEnded += OnCommandEnded;
 
                 Log("Initialize() done");
                 WriteToCmd("Плагин «Картограмма» загружен. Команда: OpenKartogramma");
@@ -93,6 +97,14 @@ namespace KartogrammaPlugin
         public void Terminate()
         {
             Application.SystemVariableChanged -= OnSysVarChanged;
+            Application.Idle -= OnIdleAddRibbon;
+            try
+            {
+                Application.DocumentManager.DocumentCreated -= OnDocumentCreated;
+                foreach (Document d in Application.DocumentManager)
+                    d.CommandEnded -= OnCommandEnded;
+            }
+            catch { }
         }
 
         // ── Простая тестовая команда (без Civil 3D зависимостей) ─────────────────
@@ -208,8 +220,13 @@ namespace KartogrammaPlugin
                             { BasePoint = p1.Value, UseBasePoint = true };
                             var p2 = ed.GetPoint(opts2);
                             if (p2.Status != PromptStatus.OK) continue;
-                            double dx = p2.Value.X - p1.Value.X;
-                            double dy = p2.Value.Y - p1.Value.Y;
+                            // Точки приходят в текущей ПСК, а сетка строится в МСК:
+                            // при повёрнутой ПСК угол по «сырым» координатам
+                            // отсчитывался бы от оси X ПСК, а не мира.
+                            var w1 = ToWcs(ed, p1.Value);
+                            var w2 = ToWcs(ed, p2.Value);
+                            double dx = w2.X - w1.X;
+                            double dy = w2.Y - w1.Y;
                             if (Math.Abs(dx) > 1e-9 || Math.Abs(dy) > 1e-9)
                                 pickedAngle = Math.Atan2(dy, dx) * 180.0 / Math.PI;
                             continue;
@@ -218,8 +235,9 @@ namespace KartogrammaPlugin
                             var bp = ed.GetPoint("\nУкажите базовую точку сетки: ");
                             if (bp.Status == PromptStatus.OK)
                             {
-                                pickedBaseX = bp.Value.X;
-                                pickedBaseY = bp.Value.Y;
+                                var wb = ToWcs(ed, bp.Value);
+                                pickedBaseX = wb.X;
+                                pickedBaseY = wb.Y;
                             }
                             continue;
 
@@ -327,7 +345,9 @@ namespace KartogrammaPlugin
                                 { BasePoint = sp1.Value, UseBasePoint = true };
                                 var sp2 = ed.GetPoint(spo);
                                 if (sp2.Status != PromptStatus.OK) continue;
-                                double dist = Math.Abs(sp2.Value.X - sp1.Value.X);
+                                // Вдоль оси X сетки (с учётом угла поворота), в МСК
+                                double dist = Math.Abs(GridAxisDelta(ed, mainForm,
+                                    sp1.Value, sp2.Value, alongY: false));
                                 if (dist > 0.01) pickedSizeX = Math.Round(dist, 2);
                             }
                             continue;
@@ -340,7 +360,9 @@ namespace KartogrammaPlugin
                                 { BasePoint = sp1.Value, UseBasePoint = true };
                                 var sp2 = ed.GetPoint(spo);
                                 if (sp2.Status != PromptStatus.OK) continue;
-                                double dist = Math.Abs(sp2.Value.Y - sp1.Value.Y);
+                                // Вдоль оси Y сетки (с учётом угла поворота), в МСК
+                                double dist = Math.Abs(GridAxisDelta(ed, mainForm,
+                                    sp1.Value, sp2.Value, alongY: true));
                                 if (dist > 0.01) pickedSizeY = Math.Round(dist, 2);
                             }
                             continue;
@@ -361,7 +383,7 @@ namespace KartogrammaPlugin
 
                                     bool ok;
                                     using (doc.LockDocument())
-                                        ok = proc.DrawManualTriple(prt.Value);
+                                        ok = proc.DrawManualTriple(ToWcs(ed, prt.Value));
                                     if (!ok)
                                         ed.WriteMessage(
                                             "\n[Картограмма] В этой точке нет обеих поверхностей — тройка не проставлена.");
@@ -372,35 +394,49 @@ namespace KartogrammaPlugin
                         case PickRequest.CalloutLabel:
                             {
                                 var opts = mainForm.CollectOptionsPublic();
-                                ed.WriteMessage("\nВыноска отметок: нажмите на любую цифру тройки отметок (ENTER — выход).");
+                                ed.WriteMessage("\nВыноска отметок: нажмите на любую цифру тройки отметок или на объём (ENTER — выход).");
                                 var proc = new KartogrammaProcessor(doc, opts);
                                 while (true)
                                 {
-                                    // Шаг 1: пользователь кликает на любую цифру тройки
-                                    var po1 = new PromptPointOptions(
-                                        "\nНажмите на любую цифру тройки отметок (ENTER — выход): ")
+                                    // Шаг 1: пользователь кликает на цифру тройки или объёма.
+                                    // Выбор ОБЪЕКТА, а не точки: объектные привязки не
+                                    // уводят клик к точке вставки соседней цифры, а при
+                                    // наложении берётся видимый сверху текст (объём над
+                                    // тройкой) — его и хотел перенести пользователь.
+                                    var po1 = new PromptEntityOptions(
+                                        "\nНажмите на цифру тройки отметок или объёма (ENTER — выход): ")
                                     { AllowNone = true };
-                                    var pr1 = ed.GetPoint(po1);
+                                    var pr1 = ed.GetEntity(po1);
                                     if (pr1.Status != PromptStatus.OK) break;
 
-                                    // Шаг 2: из реальных позиций меток вычисляем
-                                    // точный узел сетки — откуда стартует выноска
-                                    var nodePos = proc.FindTripletOrigin(pr1.Value);
-                                    if (nodePos == null)
+                                    // Шаг 2: что выбрано и откуда стартует выноска —
+                                    // точный узел тройки (из позиций её меток) или
+                                    // центр подписи объёма
+                                    var kind = proc.ClassifyCalloutPick(ToWcs(ed, pr1.PickedPoint),
+                                        out var basePt, out var volumeId, pr1.ObjectId);
+                                    if (kind == KartogrammaProcessor.CalloutKind.None)
                                     {
                                         ed.WriteMessage("\n[Картограмма] Рядом с указанной точкой не найдены отметки.");
                                         continue;
                                     }
 
                                     // Шаг 3: пользователь выбирает новое место —
-                                    // резинка тянется от узла (центра тройки)
-                                    var po2 = new PromptPointOptions("\nНовое положение тройки: ")
-                                    { BasePoint = nodePos.Value, UseBasePoint = true };
+                                    // резинка тянется от узла / центра объёма
+                                    bool isVolume = kind == KartogrammaProcessor.CalloutKind.Volume;
+                                    var po2 = new PromptPointOptions(isVolume
+                                        ? "\nНовое положение объёма: "
+                                        : "\nНовое положение тройки: ")
+                                    { BasePoint = ToUcs(ed, basePt), UseBasePoint = true };
                                     var pr2 = ed.GetPoint(po2);
                                     if (pr2.Status != PromptStatus.OK) break;
 
                                     using (doc.LockDocument())
-                                        proc.CreateLabelCallout(nodePos.Value, pr2.Value);
+                                    {
+                                        if (isVolume)
+                                            proc.CreateVolumeCallout(volumeId, ToWcs(ed, pr2.Value));
+                                        else
+                                            proc.CreateLabelCallout(basePt, ToWcs(ed, pr2.Value));
+                                    }
                                 }
                             }
                             continue;
@@ -412,6 +448,29 @@ namespace KartogrammaPlugin
             }
             ed.WriteMessage("\n[Картограмма] Диалог закрыт.\n");
         }
+
+        // ── Точки из GetPoint — в текущей ПСК; геометрия картограммы — в МСК ──
+        private static Autodesk.AutoCAD.Geometry.Point3d ToWcs(
+            Editor ed, Autodesk.AutoCAD.Geometry.Point3d ucsPt) =>
+            ucsPt.TransformBy(ed.CurrentUserCoordinateSystem);
+
+        // Проекция отрезка p1→p2 (точки в ПСК) на ось сетки X или Y в МСК
+        // с текущим углом поворота из диалога.
+        private static double GridAxisDelta(Editor ed, MainKartogrammaForm form,
+            Autodesk.AutoCAD.Geometry.Point3d p1, Autodesk.AutoCAD.Geometry.Point3d p2,
+            bool alongY)
+        {
+            var w1 = ToWcs(ed, p1);
+            var w2 = ToWcs(ed, p2);
+            double a  = form.CollectOptionsPublic().RotationRadians;
+            double dx = w2.X - w1.X, dy = w2.Y - w1.Y;
+            return alongY ? -dx * Math.Sin(a) + dy * Math.Cos(a)
+                          :  dx * Math.Cos(a) + dy * Math.Sin(a);
+        }
+
+        private static Autodesk.AutoCAD.Geometry.Point3d ToUcs(
+            Editor ed, Autodesk.AutoCAD.Geometry.Point3d wcsPt) =>
+            wcsPt.TransformBy(ed.CurrentUserCoordinateSystem.Inverse());
 
         // ── Событие: лента полностью инициализирована ───────────────────────────
         private static void OnRibbonItemInitialized(object sender, RibbonItemEventArgs e)
@@ -425,6 +484,12 @@ namespace KartogrammaPlugin
         // ── Запасной путь через Idle: срабатывает, даже если ItemInitialized
         //    уже не возникнет (лента построена до загрузки плагина) ───────────────
         private static int _idleTicks = 0;
+        // Сколько Idle подряд панель должна найтись на ленте, прежде чем
+        // перестать следить: после смены рабочего пространства AutoCAD
+        // достраивает ленту не за один цикл, и только что добавленная панель
+        // может исчезнуть вместе со старой вкладкой «Надстройки».
+        private const int ConfirmIdleTicks = 5;
+        private static int _confirmedTicks = 0;
         private static void OnIdleAddRibbon(object? sender, EventArgs e)
         {
             _idleTicks++;
@@ -438,14 +503,21 @@ namespace KartogrammaPlugin
                 return;
             }
 
+            // Флаг не доверяем: панель могла пропасть при перестройке ленты
+            if (_ribbonReady && !IsPanelOnRibbon(ribbon))
+            {
+                Log($"Idle #{_idleTicks}: panel vanished from ribbon — re-adding");
+                _ribbonReady   = false;
+                _confirmedTicks = 0;
+            }
             AddRibbonButton();
 
-            if (_ribbonReady)
+            if (_ribbonReady && ++_confirmedTicks >= ConfirmIdleTicks)
             {
                 // Успех — отписываемся от обоих источников
                 Application.Idle -= OnIdleAddRibbon;
                 ComponentManager.ItemInitialized -= OnRibbonItemInitialized;
-                Log($"Idle #{_idleTicks}: ribbon button added — unsubscribed");
+                Log($"Idle #{_idleTicks}: ribbon button confirmed — unsubscribed");
             }
             else if (_idleTicks <= 5 || _idleTicks % 30 == 0)
             {
@@ -456,20 +528,55 @@ namespace KartogrammaPlugin
         }
 
         // ── Событие: смена рабочего пространства (WSCURRENT) ────────────────────
-        // При переключении workspace лента пересоздаётся → нужно снова добавить кнопку
+        // Элементы ленты, добавленные через API, не сохраняются в CUI: при
+        // переключении workspace (и после CUI/QUICKCUI) лента строится заново
+        // без них. Autodesk рекомендует пересоздавать их на Application.Idle —
+        // в момент самого WSCURRENT лента ещё старая, и добавленная в неё
+        // панель тут же пропадает вместе со старой вкладкой.
         private static void OnSysVarChanged(object sender, SystemVariableChangedEventArgs e)
         {
-            if (e.Name.Equals("WSCURRENT", StringComparison.OrdinalIgnoreCase))
-            {
-                _ribbonReady = false; // сбрасываем флаг — нужно создать заново
-                if (ComponentManager.Ribbon != null)
-                    AddRibbonButton();
-                else
-                {
-                    ComponentManager.ItemInitialized += OnRibbonItemInitialized;
-                    Application.Idle += OnIdleAddRibbon;
-                }
-            }
+            if (!e.Name.Equals("WSCURRENT", StringComparison.OrdinalIgnoreCase)) return;
+            // Во время CUI/QUICKCUI WSCURRENT меняется многократно — дождёмся
+            // конца команды (OnCommandEnded).
+            var cmds = Application.GetSystemVariable("CMDNAMES") as string ?? "";
+            if (cmds.IndexOf("CUI", StringComparison.OrdinalIgnoreCase) >= 0) return;
+            ScheduleRibbonRestore("WSCURRENT changed");
+        }
+
+        private static void OnCommandEnded(object sender, CommandEventArgs e)
+        {
+            var name = e.GlobalCommandName ?? "";
+            if (name.Equals("CUI", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("QUICKCUI", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("CUILOAD", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("CUIUNLOAD", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("MENU", StringComparison.OrdinalIgnoreCase))
+                ScheduleRibbonRestore($"command {name} ended");
+        }
+
+        private static void OnDocumentCreated(object sender, DocumentCollectionEventArgs e)
+        {
+            if (e.Document == null) return;
+            e.Document.CommandEnded -= OnCommandEnded;
+            e.Document.CommandEnded += OnCommandEnded;
+        }
+
+        private static void ScheduleRibbonRestore(string reason)
+        {
+            Log($"Ribbon restore scheduled: {reason}");
+            _ribbonReady    = false;   // сбрасываем флаг — нужно создать заново
+            _confirmedTicks = 0;
+            Application.Idle -= OnIdleAddRibbon;   // без двойной подписки
+            Application.Idle += OnIdleAddRibbon;
+        }
+
+        /// <summary>Есть ли наша панель на какой-либо вкладке текущей ленты.</summary>
+        private static bool IsPanelOnRibbon(RibbonControl ribbon)
+        {
+            foreach (RibbonTab tab in ribbon.Tabs)
+                foreach (RibbonPanel p in tab.Panels)
+                    if (p.Source?.Id == "KC_PANEL") return true;
+            return false;
         }
 
         // ════════════════════════════════════════════════════════════════════════

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Autodesk.Civil.DatabaseServices;
 
 namespace KartogrammaPlugin
@@ -186,6 +187,37 @@ namespace KartogrammaPlugin
                 return l1 * _az[t] + l2 * _bz[t] + l3 * _cz[t];
             }
             return null;
+        }
+
+        /// <summary>
+        /// Все треугольники, габариты которых задевают прямоугольник (план),
+        /// каждый по одному разу — для точного разделения ячейки (TinOverlay).
+        /// </summary>
+        public void ForEachTriangle(double x0, double y0, double x1, double y1,
+            Action<double, double, double, double, double, double, double, double, double> f)
+        {
+            int j0 = Clamp((int)Math.Floor((x0 - _minX) / _step), 0, _nx - 1);
+            int j1 = Clamp((int)Math.Floor((x1 - _minX) / _step), 0, _nx - 1);
+            int i0 = Clamp((int)Math.Floor((y0 - _minY) / _step), 0, _ny - 1);
+            int i1 = Clamp((int)Math.Floor((y1 - _minY) / _step), 0, _ny - 1);
+            if (x1 < _minX || y1 < _minY || x0 > _minX + _nx * _step || y0 > _minY + _ny * _step) return;
+
+            var seen = new HashSet<int>();
+            for (int i = i0; i <= i1; i++)
+            for (int j = j0; j <= j1; j++)
+            {
+                int cell = i * _nx + j;
+                for (int q = _cellStart[cell]; q < _cellStart[cell + 1]; q++)
+                {
+                    int t = _cellTris[q];
+                    if (!seen.Add(t)) continue;
+                    if (Math.Max(_ax[t], Math.Max(_bx[t], _cx[t])) < x0 ||
+                        Math.Min(_ax[t], Math.Min(_bx[t], _cx[t])) > x1 ||
+                        Math.Max(_ay[t], Math.Max(_by[t], _cy[t])) < y0 ||
+                        Math.Min(_ay[t], Math.Min(_by[t], _cy[t])) > y1) continue;
+                    f(_ax[t], _ay[t], _az[t], _bx[t], _by[t], _bz[t], _cx[t], _cy[t], _cz[t]);
+                }
+            }
         }
 
         private static int Clamp(int v, int lo, int hi) => v < lo ? lo : v > hi ? hi : v;

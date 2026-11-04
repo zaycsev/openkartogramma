@@ -1,11 +1,11 @@
 ; ============================================================
 ;  Inno Setup Script -- Kartogramma Plugin v{#AppVersion}
-;  Build:  .\build-installer.ps1 [-Version "1.1.3"]
+;  Build:  .\build-installer.ps1 [-Version "1.1.4"]
 ;  Output: dist\Setup_KartogrammaPlugin_v*.exe
 ; ============================================================
 
 #ifndef AppVersion
-  #define AppVersion "1.1.3"
+  #define AppVersion "1.1.4"
 #endif
 
 #define AppName      "Kartogramma zemlyanyh rabot"

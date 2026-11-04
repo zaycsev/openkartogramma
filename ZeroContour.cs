@@ -10,11 +10,11 @@ namespace KartogrammaPlugin
     /// выемочную части (см. ZeroLineSplit) и ограничивает штриховки.
     ///
     /// Алгоритм — marching squares по знаку рабочей отметки. Точки пересечения
-    /// берутся ЛИНЕЙНОЙ интерполяцией между узлами выборки: рабочая отметка —
-    /// непрерывная величина, и на отрезке между узлами она считается линейной
-    /// ровно так же, как при расчёте объёма. Поэтому линия на чертеже проходит
-    /// там же, где проходит граница разделения объёмов, — цифры и картинка не
-    /// расходятся.
+    /// уточняются бисекцией по реальной отметке (как край штриховки в
+    /// CellClipper), седловые квадратики решаются по реальной отметке в
+    /// центре — поэтому линия совпадает с краем штриховки, а не с линейной
+    /// интерполяцией между узлами выборки, которая врёт там, где между узлами
+    /// проходит ребро треугольника TIN.
     ///
     /// Узлы без данных (NaN) обрывают контур: там работ нет.
     ///
@@ -31,8 +31,16 @@ namespace KartogrammaPlugin
         /// <param name="steps">Число интервалов выборки по стороне.</param>
         /// <param name="height">Рабочая отметка в точке; NaN — данных нет.</param>
         internal static List<List<(double X, double Y)>> Trace(
-            double szX, double szY, int steps, Func<double, double, double> height)
+            double szX, double szY, int steps, Func<double, double, double> height,
+            double exactTol = 0)
         {
+            // Сторона нулевой линии для точного уточнения (как у штриховки)
+            int Side(double x, double y)
+            {
+                double hv = height(x, y);
+                return double.IsNaN(hv) ? 0 : hv > 0 ? 1 : -1;
+            }
+
             var result = new List<List<(double X, double Y)>>();
 
             int n = Math.Max(2, steps);
@@ -67,8 +75,32 @@ namespace KartogrammaPlugin
                 lb.Add(ka);
             }
 
-            // Точка h = 0 на ребре между значениями a и b разных знаков.
-            static double Cross(double a, double b) => a / (a - b);
+            // Точка h = 0 на ребре между значениями a и b разных знаков — доля
+            // ребра от его начала. Уточняется по РЕАЛЬНОЙ отметке бисекцией,
+            // как край штриховки в CellClipper: между узлами выборки может
+            // пройти ребро треугольника TIN, и линейная интерполяция по двум
+            // концам уводила линию на сантиметры от края штриховки (на мелких
+            // пятнах штриховка «вылезала» за линию). Остаток интервала после
+            // бисекции — линейно. Каждое ребро считается один раз, поэтому
+            // соседние квадратики получают одну и ту же точку.
+            const int Refine = KartogrammaPlugin.CellClipper.EdgeRefineSteps;
+            var cross = new Dictionary<long, double>();
+            double Cross(long key, double a, double b, double x0, double y0, double ex, double ey)
+            {
+                if (cross.TryGetValue(key, out double t)) return t;
+                double lo = 0, hi = 1, hLo = a, hHi = b;
+                for (int k = 0; k < Refine; k++)
+                {
+                    double m = (lo + hi) * 0.5;
+                    double hm = height(x0 + ex * m, y0 + ey * m);
+                    if (double.IsNaN(hm)) break;
+                    if ((hm > 0) == (hLo > 0)) { lo = m; hLo = hm; }
+                    else                       { hi = m; hHi = hm; }
+                }
+                t = lo + (hi - lo) * hLo / (hLo - hHi);
+                cross[key] = t;
+                return t;
+            }
 
             for (int i = 0; i < n; i++)
             for (int j = 0; j < n; j++)
@@ -90,10 +122,17 @@ namespace KartogrammaPlugin
                 long kL = Key(2, i,     j);
                 long kR = Key(2, i,     j + 1);
 
-                var pB = ((j + Cross(bl, br)) * dx, i * dy);
-                var pT = ((j + Cross(tl, tr)) * dx, (i + 1) * dy);
-                var pL = (j * dx,       (i + Cross(bl, tl)) * dy);
-                var pR = ((j + 1) * dx, (i + Cross(br, tr)) * dy);
+                // Точки считаются только на рёбрах со сменой знака — их и
+                // использует case ниже; на остальных рёбрах не вызываются.
+                (double X, double Y) pB = default, pT = default, pL = default, pR = default;
+                if ((bl > 0) != (br > 0))
+                    pB = ((j + Cross(kB, bl, br, j * dx, i * dy, dx, 0)) * dx, i * dy);
+                if ((tl > 0) != (tr > 0))
+                    pT = ((j + Cross(kT, tl, tr, j * dx, (i + 1) * dy, dx, 0)) * dx, (i + 1) * dy);
+                if ((bl > 0) != (tl > 0))
+                    pL = (j * dx, (i + Cross(kL, bl, tl, j * dx, i * dy, 0, dy)) * dy);
+                if ((br > 0) != (tr > 0))
+                    pR = ((j + 1) * dx, (i + Cross(kR, br, tr, (j + 1) * dx, i * dy, 0, dy)) * dy);
 
                 switch (cs)
                 {
@@ -105,18 +144,30 @@ namespace KartogrammaPlugin
                     case 6: case 9:  Link(kT, pT, kB, pB); break;
 
                     // Седловые случаи: как соединять диагональные пары, решает
-                    // значение в центре квадратика (билинейное среднее).
+                    // РЕАЛЬНАЯ отметка в центре квадратика — так же, как при
+                    // обрезке штриховки (CellClipper). Билинейное среднее углов
+                    // здесь врёт: тонкая перемычка насыпи, проходящая между
+                    // узлами выборки, по среднему «рвётся», и линия нулевых
+                    // работ отрезала островок, который штриховка (по
+                    // поверхностям) верно соединяла с соседней насыпью.
                     case 5:
-                        if ((bl + br + tr + tl) > 0)
+                        if (MidPositive(i, j, bl, br, tr, tl))
                              { Link(kR, pR, kB, pB); Link(kT, pT, kL, pL); }
                         else { Link(kB, pB, kL, pL); Link(kT, pT, kR, pR); }
                         break;
                     case 10:
-                        if ((bl + br + tr + tl) > 0)
+                        if (MidPositive(i, j, bl, br, tr, tl))
                              { Link(kL, pL, kB, pB); Link(kR, pR, kT, pT); }
                         else { Link(kR, pR, kB, pB); Link(kL, pL, kT, pT); }
                         break;
                 }
+            }
+
+            bool MidPositive(int i, int j, double bl, double br, double tr, double tl)
+            {
+                double mid = height((j + 0.5) * dx, (i + 0.5) * dy);
+                if (double.IsNaN(mid)) mid = (bl + br + tr + tl) / 4.0;
+                return mid > 0;
             }
 
             if (adj.Count == 0) return result;
@@ -151,6 +202,10 @@ namespace KartogrammaPlugin
                         while (guard-- > 0)
                         {
                             if (!Take(cur, nxt)) break;
+                            if (exactTol > 0)
+                                CellClipper.RefineBoundary(Side, pos[cur], pos[nxt],
+                                    exactTol, szX, szY, chain,
+                                    reach: Math.Sqrt(dx * dx + dy * dy));
                             chain.Add(pos[nxt]);
 
                             long? cont = null;

@@ -14,6 +14,7 @@
     <Compile Include="..\CellClipper.cs"   Link="CellClipper.cs" />
     <Compile Include="..\ZeroLineSplit.cs" Link="ZeroLineSplit.cs" />
     <Compile Include="..\ZeroContour.cs"   Link="ZeroContour.cs" />
+    <Compile Include="..\TinOverlay.cs"    Link="TinOverlay.cs" />
   </ItemGroup>
 
   <ItemGroup>

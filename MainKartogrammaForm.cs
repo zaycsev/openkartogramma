@@ -52,6 +52,7 @@ namespace KartogrammaPlugin
         private static bool     _sClip = true,  _sHide = true;
         private static bool     _sHideVol  = true;
         private static bool     _sHideTable = false;
+        private static bool     _sVolArea  = false;   // «Площадь и объём» — по умолчанию выключено
         private static bool     _sMinVolChk = true;
         private static decimal  _sMinVol   = 0.01m,  _sNodeStep  = 0.05m;
         private static int      _sVolMethodIdx = 0;  // 0=Триангуляция, 1=Квадраты
@@ -130,6 +131,7 @@ namespace KartogrammaPlugin
         // ── Объёмы ──────────────────────────────────────────────────────────────
         private CheckBox      chkHideVol   = null!;
         private CheckBox      chkHideTable = null!;
+        private CheckBox      chkVolArea   = null!;
         private ComboBox      cmbStyleVol  = null!;
         private ComboBox      cmbVolPrec   = null!;
         private NumericUpDown nudVolHeight = null!;
@@ -259,7 +261,7 @@ namespace KartogrammaPlugin
 
             // Строка 2: По горизонт., м:  [nud] [>>]
             grpGrid.Controls.Add(Lbl("По горизонт., м:", S(10), S(42)));
-            nudSizeX = Nud(0.01m, 200m, 5m, 2, 0.5m);
+            nudSizeX = Nud(0.001m, 200m, 5m, 3, 0.5m);
             nudSizeX.Location = new Point(S(130), S(40)); nudSizeX.Size = new Size(S(70), S(22));
             grpGrid.Controls.Add(nudSizeX);
             var btnPickSizeX = new Button { Text = ">>", Location = new Point(S(324), S(40)), Size = new Size(S(32), S(22)) };
@@ -269,7 +271,7 @@ namespace KartogrammaPlugin
 
             // Строка 3: По вертикали, м:  [nud] [>>]
             grpGrid.Controls.Add(Lbl("По вертикали, м:", S(10), S(66)));
-            nudSizeY = Nud(0.01m, 200m, 5m, 2, 0.5m);
+            nudSizeY = Nud(0.001m, 200m, 5m, 3, 0.5m);
             nudSizeY.Location = new Point(S(130), S(64)); nudSizeY.Size = new Size(S(70), S(22));
             grpGrid.Controls.Add(nudSizeY);
             var btnPickSizeY = new Button { Text = ">>", Location = new Point(S(324), S(64)), Size = new Size(S(32), S(22)) };
@@ -473,7 +475,7 @@ namespace KartogrammaPlugin
                 Location      = new Point(S(218), S(41)),
                 Size          = new Size(S(80), S(22))
             };
-            cmbDecimal.Items.AddRange(new object[] { "Точка (.)", "Запятая (,)" });
+            cmbDecimal.Items.AddRange(new object[] { "Точка (.)", "Запятая (,)", "Ничего" });
             cmbDecimal.SelectedIndex = 0;
             grpL.Controls.Add(cmbDecimal);
 
@@ -614,14 +616,25 @@ namespace KartogrammaPlugin
             grpVol.Controls.Add(cmbVolMethod);
 
             grpVol.Controls.Add(Lbl("Шаг субсетки:", S(10), S(112)));
-            nudNodeStep = Nud(0.01m, 1.00m, 0.05m, 2, 0.01m);
-            nudNodeStep.Location = new Point(S(96), S(109)); nudNodeStep.Size = new Size(S(60), S(22));
+            // До 1 мкм (лазерное сканирование): шаг мельче, чем позволяет
+            // субсетка, считается точно по треугольникам TIN.
+            nudNodeStep = Nud(0.000001m, 1.00m, 0.05m, 2, 0.01m);
+            // Знаков — сколько нужно значению: «0.05», а не «0.050000»;
+            // введённый мелкий шаг (до 0.000001) показывается целиком.
+            nudNodeStep.ValueChanged += (s, e) =>
+            {
+                decimal v = nudNodeStep.Value;
+                int d = 2;
+                while (d < 6 && decimal.Round(v, d) != v) d++;
+                if (nudNodeStep.DecimalPlaces != d) nudNodeStep.DecimalPlaces = d;
+            };
+            nudNodeStep.Location = new Point(S(96), S(109)); nudNodeStep.Size = new Size(S(76), S(22));
             grpVol.Controls.Add(nudNodeStep);
-            grpVol.Controls.Add(new Label { Text = "м", Location = new Point(S(160), S(112)), AutoSize = true });
+            grpVol.Controls.Add(new Label { Text = "м", Location = new Point(S(176), S(112)), AutoSize = true });
             grpVol.Controls.Add(new Label
             {
                 Text      = "0.05 = 5 см  (СП 45.13330.201)",
-                Location  = new Point(S(176), S(112)),
+                Location  = new Point(S(192), S(112)),
                 AutoSize  = true,
                 ForeColor = Color.Gray,
                 Font      = new Font("Segoe UI", 7.5f)
@@ -687,6 +700,17 @@ namespace KartogrammaPlugin
                 Font     = new Font("Segoe UI", 7.5f)
             };
             grpVol.Controls.Add(chkHideTable);
+
+            // Объём и площадь ячейки — в круге, разделённом пополам
+            chkVolArea = new CheckBox
+            {
+                Text     = "Площадь и объём",
+                Checked  = false,
+                Location = new Point(S(232), S(230)),
+                Size     = new Size(S(140), S(20)),
+                Font     = new Font("Segoe UI", 7.5f)
+            };
+            grpVol.Controls.Add(chkVolArea);
 
             Controls.Add(grpVol);
             rightY += volH + S(6);
@@ -793,14 +817,14 @@ namespace KartogrammaPlugin
         public void ApplyPickedSizeX(double size)
         {
             nudSizeX.Value = (decimal)Math.Max((double)nudSizeX.Minimum,
-                Math.Min((double)nudSizeX.Maximum, Math.Round(size, 2)));
+                Math.Min((double)nudSizeX.Maximum, Math.Round(size, 3)));
         }
 
         /// <summary>Установить размер ячейки по вертикали после pick.</summary>
         public void ApplyPickedSizeY(double size)
         {
             nudSizeY.Value = (decimal)Math.Max((double)nudSizeY.Minimum,
-                Math.Min((double)nudSizeY.Maximum, Math.Round(size, 2)));
+                Math.Min((double)nudSizeY.Maximum, Math.Round(size, 3)));
         }
 
         private void OnBuildGrid(object? sender, EventArgs e)
@@ -1010,6 +1034,10 @@ namespace KartogrammaPlugin
                 // объектах сложно, проще перестроить:
                 o.HideMaskText.ToString(), o.HideMaskVolume.ToString(),
                 o.HideMaskTable.ToString(),
+                // Круг подгоняется под размер цифр — при включённой опции
+                // высота/стиль подписей объёма меняют геометрию круга.
+                o.ShowVolumeArea.ToString(),
+                o.ShowVolumeArea ? D(o.VolumeTextHeight) + "/" + o.TextStyleName : "",
             });
         }
 
@@ -1073,10 +1101,11 @@ namespace KartogrammaPlugin
             o.TextPrecision    = cmbPrecision.SelectedIndex;
             o.LargeTextHeight  = (double)nudHeight.Value;
             o.SmallTextHeight  = (double)nudHeight.Value;
-            o.DecimalSeparator = cmbDecimal.SelectedIndex == 1 ? "," : ".";
+            o.DecimalSeparator = cmbDecimal.SelectedIndex switch { 1 => ",", 2 => "", _ => "." };
             o.HideMaskText     = chkHide.Checked;
             o.HideMaskVolume   = chkHideVol.Checked;
             o.HideMaskTable    = chkHideTable.Checked;
+            o.ShowVolumeArea   = chkVolArea.Checked;
             o.Annotative       = false;
 
             // Цвета
@@ -1280,6 +1309,7 @@ namespace KartogrammaPlugin
             _sVolHeight  = nudVolHeight.Value;
             _sHideVol    = chkHideVol.Checked;
             _sHideTable  = chkHideTable.Checked;
+            _sVolArea    = chkVolArea.Checked;
             _sNodeStep   = nudNodeStep.Value;
             _sVolMethodIdx = cmbVolMethod.SelectedIndex;
             _sMinVolChk  = chkMinVol.Checked;
@@ -1349,6 +1379,7 @@ namespace KartogrammaPlugin
             nudVolHeight.Value = Clamp(_sVolHeight, nudVolHeight.Minimum, nudVolHeight.Maximum);
             chkHideVol.Checked = _sHideVol;
             chkHideTable.Checked = _sHideTable;
+            chkVolArea.Checked   = _sVolArea;
             nudNodeStep.Value  = Clamp(_sNodeStep, nudNodeStep.Minimum, nudNodeStep.Maximum);
             cmbVolMethod.SelectedIndex = Math.Min(Math.Max(_sVolMethodIdx, 0), cmbVolMethod.Items.Count - 1);
             nudNodeStep.Enabled = cmbVolMethod.SelectedIndex == 0;
@@ -1438,6 +1469,7 @@ namespace KartogrammaPlugin
                 _sVolHeight  = Dec("VolHeight", _sVolHeight);
                 _sHideVol    = Bool("HideVol", _sHideVol);
                 _sHideTable  = Bool("HideTable", _sHideTable);
+                _sVolArea    = Bool("VolArea", _sVolArea);
                 _sNodeStep   = Dec("NodeStep", _sNodeStep);
                 _sVolMethodIdx = Int("VolMethodIdx", _sVolMethodIdx);
                 _sMinVolChk  = Bool("MinVolChk", _sMinVolChk);
@@ -1512,6 +1544,7 @@ namespace KartogrammaPlugin
                 PD("VolHeight", _sVolHeight);
                 PB("HideVol", _sHideVol);
                 PB("HideTable", _sHideTable);
+                PB("VolArea", _sVolArea);
                 PD("NodeStep", _sNodeStep);
                 PI("VolMethodIdx", _sVolMethodIdx);
                 PB("MinVolChk", _sMinVolChk);

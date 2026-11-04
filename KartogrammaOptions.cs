@@ -51,6 +51,7 @@ namespace KartogrammaPlugin
         public double LargeTextHeight  { get; set; } = 0.15;
         public double SmallTextHeight  { get; set; } = 0.45;
         public int    TextPrecision    { get; set; } = 2;
+        /// <summary>Разделитель дробной части на чертеже: ".", "," или "" (без разделителя).</summary>
         public string DecimalSeparator { get; set; } = ".";
         public bool   HideMaskText     { get; set; } = true;
         public bool   HideMaskVolume   { get; set; } = true;
@@ -96,6 +97,11 @@ namespace KartogrammaPlugin
         public double MinVolume          { get; set; } = 0.01;
         public double VolumeTextHeight   { get; set; } = 0.25;
         public int    VolumePrecision    { get; set; } = 2;
+        /// <summary>
+        /// «Площадь и объём»: подпись ячейки — круг, разделённый пополам;
+        /// сверху объём, снизу площадь. Размер круга подгоняется под цифры.
+        /// </summary>
+        public bool   ShowVolumeArea     { get; set; } = false;
 
         /// <summary>
         /// Шаг субсетки для точного расчёта граничных объёмов, в метрах.

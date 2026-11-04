@@ -20,6 +20,38 @@ namespace KartogrammaTests
             double szX, double szY, Func<double, double, double> h)
             => ZeroContour.Trace(szX, szY, Steps, h);
 
+        // ── Седло: тонкая перемычка между узлами выборки ──────────────
+
+        [Fact]
+        public void ThinDiagonalBand_StaysConnected()
+        {
+            // Полоса насыпи вдоль диагонали, у́же шага выборки: в седловых
+            // квадратиках два угла на полосе, два — в выемке, центр — на
+            // полосе. Среднее углов отрицательное и раньше «рвало» полосу на
+            // куски (файл «Холмик»: островок отделялся от соседней насыпи,
+            // а штриховка по поверхностям их верно соединяла). Решать седло
+            // должна реальная отметка в центре: две сплошные линии.
+            var res = ZeroContour.Trace(1, 1, 2,
+                (x, y) => 0.3 - 20 * (x - y) * (x - y));
+            Assert.Equal(2, res.Count);
+        }
+
+        [Fact]
+        public void KinkBetweenNodes_ZeroFoundOnRealSurface()
+        {
+            // Излом рабочей отметки между узлами выборки (ребро треугольника
+            // TIN): настоящий ноль при x = 0.32. Линейная интерполяция по
+            // узлам 0.3 (−0.2) и 0.4 (+0.107) дала бы x ≈ 0.365 — на 4.5 см
+            // мимо края штриховки, которую CellClipper строит по поверхности.
+            Func<double, double, double> h = (x, y) =>
+                x < 0.33 ? (x - 0.32) * 10 : 0.1 + (x - 0.33) * 0.1;
+            var res = ZeroContour.Trace(1, 1, 10, h);
+
+            var line = Assert.Single(res);
+            foreach (var p in line)
+                Assert.Equal(0.32, p.X, 3);
+        }
+
         // ── Нечего трассировать ───────────────────────────────────────
 
         [Fact]

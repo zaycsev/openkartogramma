@@ -81,7 +81,7 @@
 
 ## Установка
 
-1. Скачайте `Setup_openkartogramma_v1.1.3.exe` из [последнего релиза](https://github.com/zaycsev/openkartogramma/releases/latest).
+1. Скачайте `Setup_openkartogramma_v1.1.4.exe` из [последнего релиза](https://github.com/zaycsev/openkartogramma/releases/latest).
 2. Закройте AutoCAD Civil 3D, запустите установщик, нажмите **Далее → Установить → Готово**. Плагин ставится в `%APPDATA%\Autodesk\ApplicationPlugins\` — права администратора не нужны.
 3. Запустите Civil 3D. Плагин загрузится автоматически.
 
@@ -102,7 +102,7 @@
 
 ```powershell
 # обе сборки + установщик (авто-поиск Civil 3D и Inno Setup)
-.\build-installer.ps1 -Version "1.1.3"
+.\build-installer.ps1 -Version "1.1.4"
 ```
 
 Проект собирается под `net48` и `net8.0-windows`; управляемые сборки AutoCAD/Civil 3D берутся из установленного продукта и никогда не распространяются вместе с плагином.

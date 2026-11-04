@@ -96,7 +96,8 @@ namespace KartogrammaPlugin
                 _ms = (BlockTableRecord)trans.GetObject(
                     bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
-                EraseByLayer(trans, _ms, _o.GridLayerName);
+                // Кресты ручных троек остаются — сами тройки здесь не удаляются.
+                EraseByLayer(trans, _ms, _o.GridLayerName, e => !IsManualCross(e));
                 int drawn = DrawGridLines(trans, rows, cols, cosA, sinA, surf1!, surf2!);
 
                 // Зоны резких перепадов (зумпф и т.п.) — рамки на слое сетки
@@ -187,26 +188,7 @@ namespace KartogrammaPlugin
                 Report("Построение сетки…", 2);
                 DrawGridLines(trans, rows, cols, cosA, sinA, surf1!, surf2!);
 
-                // Штриховка выемки/насыпи и линия нулевых работ — по тем же
-                // ячейкам и по тому же признаку знака рабочей отметки, по
-                // которому делятся объёмы. Ничего не считает, только рисует.
-                DrawHatchAndZeroLine(trans, rows, cols, cosA, sinA, surf1!, surf2!);
-
-                // === Подписи отметок (чёрная / красная / рабочая) ===
-                // Отметки рисуются в каждом узле сетки (rows+1)×(cols+1).
-                // Узлы вне клип-области пропускаются (метки на «оторванных»
-                // узлах физического смысла не имеют).
-                Report("Построение подписей отметок…", 9);
                 var cells = BuildCells(surf1!, surf2!, rows, cols, cosA, sinA, area);
-                for (int nr = 0; nr <= rows; nr++)
-                for (int nc = 0; nc <= cols; nc++)
-                    DrawNodeLabel(trans, nr, nc, rows, cols, cosA, sinA, surf1!, surf2!);
-
-                // Дополнительные тройки в точках пересечения границ с линиями
-                // сетки — это «углы» образованные обрезкой. Только в режиме
-                // «Обрезать»: в «не обрезать» квадраты целые, новых углов нет.
-                if (_o.ClipCells)
-                    DrawBoundaryGridIntersectionLabels(trans, rows, cols, cosA, sinA, surf1!, surf2!);
 
                 // Подписи объёмов ячеек + подсчёт итогов (точный граничный расчёт)
                 // Считаем только ячейки с данными (перекрытие поверхностей)
@@ -219,10 +201,12 @@ namespace KartogrammaPlugin
 
                 int totalCells = dataCells.Count;
                 {
-                    int nLog = Math.Max(4, (int)Math.Ceiling(
-                        Math.Max(_o.CellSizeX, _o.CellSizeY) / _o.VolumeNodeStep));
-                    ed.WriteMessage(
-                        $"\n[Картограмма] Расчёт объёмов: шаг {_o.VolumeNodeStep:F3} м → N={nLog} на ячейку...");
+                    long nLog = SubgridWanted();
+                    ed.WriteMessage(nLog > MaxSubgridN
+                        ? $"\n[Картограмма] Расчёт объёмов: шаг {StepText()} м — мельче {MaxSubgridN} узлов на сторону ячейки, " +
+                          "объёмы считаются точно по треугольникам TIN (предел при шаге → 0)..."
+                        : $"\n[Картограмма] Расчёт объёмов: шаг {StepText()} м → N={nLog} на ячейку...");
+                    _exactVolCells = _cappedVolCells = 0;
                     ed.WriteMessage($"\n[Картограмма] Ячеек с данными: {totalCells} из {rows * cols}");
                     Report($"Расчёт объёмов ({totalCells} ячеек)…", 10);
                 }
@@ -239,6 +223,10 @@ namespace KartogrammaPlugin
                 // где через ячейку проходит нулевая линия (см. ZeroLineSplit).
                 var fillRes = new double[totalCells];
                 var cutRes  = new double[totalCells];
+                // Площади насыпной и выемочной частей ячейки — для строк
+                // «Площадь выемки/насыпи» под итоговой таблицей.
+                var fillAreaRes = new double[totalCells];
+                var cutAreaRes  = new double[totalCells];
 
                 void ComputeCell(int i)
                 {
@@ -253,13 +241,25 @@ namespace KartogrammaPlugin
                     if (_o.VolumeMethod == VolumeMethod.Squares)
                     {
                         volRes[i]  = CalcCellVolumeSquares(dc.Row, dc.Col, surf1!, surf2!,
-                            cosA, sinA, out fillRes[i], out cutRes[i]);
+                            cosA, sinA, out fillRes[i], out cutRes[i],
+                            out fillAreaRes[i], out cutAreaRes[i]);
                         areaRes[i] = CalcCellEffectiveArea(dc.Row, dc.Col, surf1!, surf2!, cosA, sinA);
+
+                        // Доли насыпи/выемки — от площади, идущей в «Площадь:»,
+                        // чтобы площадь выемки + насыпи сходилась с общей.
+                        double split = fillAreaRes[i] + cutAreaRes[i];
+                        if (split > 0)
+                        {
+                            double k = areaRes[i] / split;
+                            fillAreaRes[i] *= k;
+                            cutAreaRes[i]  *= k;
+                        }
                     }
                     else
                     {
                         volRes[i] = CalcCellVolumeAccurate(dc.Row, dc.Col, surf1!, surf2!,
-                            cosA, sinA, out areaRes[i], out fillRes[i], out cutRes[i]);
+                            cosA, sinA, out areaRes[i], out fillRes[i], out cutRes[i],
+                            out fillAreaRes[i], out cutAreaRes[i]);
                     }
                 }
 
@@ -276,6 +276,13 @@ namespace KartogrammaPlugin
                     Report($"Объём: {end}/{totalCells} ячеек…",
                         10 + (int)(80.0 * end / totalCells));
                 }
+                if (_exactVolCells > 0)
+                    ed.WriteMessage($"\n[Картограмма] Объём точно по треугольникам TIN: {_exactVolCells} ячеек");
+                if (_cappedVolCells > 0)
+                    ed.WriteMessage(
+                        $"\n[Картограмма] В {_cappedVolCells} ячейк(ах) точный расчёт неприменим (не TIN, заданная граница " +
+                        $"или зона перепада) — шаг субсетки ограничен {MaxSubgridN} узлами на сторону " +
+                        $"({Math.Max(_o.CellSizeX, _o.CellSizeY) / MaxSubgridN * 1000:0.###} мм)");
 
                 // Отладка распределения: KARTOGRAMMA_DEBUG=1 → объём и площадь
                 // каждой ячейки в командную строку (для сверки версий по ячейкам)
@@ -286,8 +293,41 @@ namespace KartogrammaPlugin
                             $"V={volRes[ci]:F3} м³, S={areaRes[ci]:F2} м², " +
                             $"насыпь={fillRes[ci]:F3}, выемка={cutRes[ci]:F3}");
 
+                // Штриховка выемки/насыпи и линия нулевых работ — по тем же
+                // ячейкам и по тому же признаку знака рабочей отметки, по
+                // которому делятся объёмы. Идёт ПОСЛЕ фазы 1: площади насыпи и
+                // выемки ячейки (субтреугольники с шагом VolumeNodeStep) точно
+                // говорят, есть ли в ней второй знак — даже небольшое пятно,
+                // которое проскочит между точками грубой разведки. И ДО подписей —
+                // чтобы штриховка лежала под цифрами.
+                var signAreas = new Dictionary<(int, int), (double Fill, double Cut)>(totalCells);
+                for (int ci = 0; ci < totalCells; ci++)
+                    signAreas[(dataCells[ci].Row, dataCells[ci].Col)] = (fillAreaRes[ci], cutAreaRes[ci]);
+                // В методе «Квадраты» площади насыпи/выемки — оценка по четырём
+                // углам ячейки, а не по поверхности: штриховку (и сверку) ведём
+                // только по точным площадям триангуляции.
+                DrawHatchAndZeroLine(trans, rows, cols, cosA, sinA, surf1!, surf2!,
+                    _o.VolumeMethod == VolumeMethod.Triangulation ? signAreas : null);
+
+                // === Подписи отметок (чёрная / красная / рабочая) ===
+                // Отметки рисуются в каждом узле сетки (rows+1)×(cols+1).
+                // Узлы вне клип-области пропускаются (метки на «оторванных»
+                // узлах физического смысла не имеют).
+                Report("Построение подписей отметок…", 91);
+                _labelBoxes.Clear();
+                EnsureVolPosRegApp(trans);
+                for (int nr = 0; nr <= rows; nr++)
+                for (int nc = 0; nc <= cols; nc++)
+                    DrawNodeLabel(trans, nr, nc, rows, cols, cosA, sinA, surf1!, surf2!);
+
+                // Дополнительные тройки в точках пересечения границ с линиями
+                // сетки — это «углы» образованные обрезкой. Только в режиме
+                // «Обрезать»: в «не обрезать» квадраты целые, новых углов нет.
+                if (_o.ClipCells)
+                    DrawBoundaryGridIntersectionLabels(trans, rows, cols, cosA, sinA, surf1!, surf2!);
+
                 // ── Фаза 2: подписи и итоги (последовательно — работа с чертежом) ──
-                double totalArea = 0;
+                double totalArea = 0, totalCutArea = 0, totalFillArea = 0;
                 for (int ci = 0; ci < totalCells; ci++)
                 {
                     var dc = dataCells[ci];
@@ -296,7 +336,9 @@ namespace KartogrammaPlugin
 
                     // Площадь перекрытия суммируем независимо от порога объёма
                     // (как в Civil — площадь не зависит от отсечения малых объёмов).
-                    totalArea += cellArea;
+                    totalArea     += cellArea;
+                    totalCutArea  += cutAreaRes[ci];
+                    totalFillArea += fillAreaRes[ci];
 
                     double volFill = fillRes[ci], volCut = cutRes[ci];
 
@@ -305,16 +347,14 @@ namespace KartogrammaPlugin
                     // есть и насыпь, и выемка. Сальдо их гасит и скрывает
                     // реальный объём работ, поэтому такие ячейки подписываются
                     // ДВУМЯ цифрами — каждая в своей части ячейки — и в итоги
-                    // идут обеими частями. Мелкий «хвост» одного знака (меньше
-                    // порога отображения) за разделение не считаем: это обычная
-                    // однородная ячейка.
+                    // идут обеими частями. Даже небольшая часть второго знака
+                    // подписывается отдельно — фильтр MinVolume здесь не
+                    // действует (он отсекает мелкие ЯЧЕЙКИ, а не части).
                     //
-                    // Нижняя граница — не только заданный минимальный объём, но
-                    // и половина последнего разряда: иначе при отключённом
-                    // фильтре (MinVolume = 0) разделённой считалась бы КАЖДАЯ
-                    // ячейка, и по всему чертежу пошли бы пары вида «+0.00».
-                    double minShow = Math.Max(_o.MinVolume,
-                        0.5 * Math.Pow(10, -_o.VolumePrecision));
+                    // Нижняя граница — половина последнего разряда: меньшая
+                    // часть округлится до нуля, и по всему чертежу пошли бы
+                    // пары вида «+0.00».
+                    double minShow = 0.5 * Math.Pow(10, -_o.VolumePrecision);
                     bool splitCell = volFill >= minShow
                                      && Math.Abs(volCut) >= minShow;
 
@@ -351,14 +391,36 @@ namespace KartogrammaPlugin
                             out double fLx, out double fLy,
                             out double cLx, out double cLy);
 
-                        AddCenteredText(trans, _o.VolumeLayerName,
+                        if (_o.ShowVolumeArea)
+                        {
+                            // «Площадь и объём»: в каждой части свой круг —
+                            // объём и площадь насыпи / выемки.
+                            PlaceVolumeAreaLabel(trans, Signed(volFill, _o.VolumePrecision),
+                                Area(fillAreaRes[ci]), vh, angle, aci,
+                                x0, y0, _o.CellSizeX, _o.CellSizeY, fLx, fLy,
+                                PartPredicate(VolLabelKind.Fill, surf1, surf2));
+                            PlaceVolumeAreaLabel(trans, Signed(volCut, _o.VolumePrecision),
+                                Area(cutAreaRes[ci]), vh, angle, aci,
+                                x0, y0, _o.CellSizeX, _o.CellSizeY, cLx, cLy,
+                                PartPredicate(VolLabelKind.Cut, surf1, surf2));
+                        }
+                        else
+                        {
+                        // Не наезжая на тройки отметок: ближайшее к центру
+                        // своей части свободное место в пределах этой части.
+                        PlaceVolumeLabel(AddCenteredText(trans, _o.VolumeLayerName,
                             LW(fLx, fLy, cosA, sinA),
                             Signed(volFill, _o.VolumePrecision),
-                            vh, angle, aci, hideMask: _o.HideMaskVolume);
-                        AddCenteredText(trans, _o.VolumeLayerName,
+                            vh, angle, aci, hideMask: _o.HideMaskVolume),
+                            x0, y0, _o.CellSizeX, _o.CellSizeY, fLx, fLy,
+                            PartPredicate(VolLabelKind.Fill, surf1, surf2), VolLabelKind.Fill);
+                        PlaceVolumeLabel(AddCenteredText(trans, _o.VolumeLayerName,
                             LW(cLx, cLy, cosA, sinA),
                             Signed(volCut, _o.VolumePrecision),
-                            vh, angle, aci, hideMask: _o.HideMaskVolume);
+                            vh, angle, aci, hideMask: _o.HideMaskVolume),
+                            x0, y0, _o.CellSizeX, _o.CellSizeY, cLx, cLy,
+                            PartPredicate(VolLabelKind.Cut, surf1, surf2), VolLabelKind.Cut);
+                        }
 
                         double dFill = Disp(volFill), dCut = Disp(Math.Abs(volCut));
                         totFill += dFill; colFill[c] += dFill; rowFill[r] += dFill;
@@ -373,10 +435,20 @@ namespace KartogrammaPlugin
                     double cy = y0 + _o.CellSizeY * 0.5;
                     FindInsideAnchor(x0, y0, _o.CellSizeX, _o.CellSizeY,
                         cx, cy, cosA, sinA, surf1!, surf2!, out double vLx, out double vLy);
-                    AddCenteredText(trans, _o.VolumeLayerName,
+                    // Не наезжая на тройки отметок: ближайшее к центру свободное
+                    // место в видимой части ячейки.
+                    if (_o.ShowVolumeArea)
+                        PlaceVolumeAreaLabel(trans, Signed(vol, _o.VolumePrecision),
+                            Area(cellArea), vh, angle, aci,
+                            x0, y0, _o.CellSizeX, _o.CellSizeY, vLx, vLy,
+                            PartPredicate(VolLabelKind.Cell, surf1, surf2));
+                    else
+                    PlaceVolumeLabel(AddCenteredText(trans, _o.VolumeLayerName,
                         LW(vLx, vLy, cosA, sinA),
                         Signed(vol, _o.VolumePrecision),
-                        vh, angle, aci, hideMask: _o.HideMaskVolume);
+                        vh, angle, aci, hideMask: _o.HideMaskVolume),
+                        x0, y0, _o.CellSizeX, _o.CellSizeY, vLx, vLy,
+                        PartPredicate(VolLabelKind.Cell, surf1, surf2), VolLabelKind.Cell);
 
                     double dispVol = Disp(absVol);
                     if (isCut) { totCut  += dispVol; colCut[c]  += dispVol; rowCut[r]  += dispVol; }
@@ -393,8 +465,11 @@ namespace KartogrammaPlugin
                     {
                         var z = _anomalyZones[zi];
                         CalcZoneVolume(z, surf1!, surf2!, cosA, sinA,
-                            out double zVol, out double zArea);
-                        totalArea += zArea;
+                            out double zVol, out double zArea,
+                            out double zFillArea, out double zCutArea);
+                        totalArea     += zArea;
+                        totalCutArea  += zCutArea;
+                        totalFillArea += zFillArea;
                         DrawZoneRect(trans, z, cosA, sinA);
                         ed.WriteMessage(
                             $"\n[Картограмма] Перепад #{zi + 1}: объём {Signed(zVol, _o.VolumePrecision)} м³, площадь {zArea:F2} м²");
@@ -404,11 +479,19 @@ namespace KartogrammaPlugin
                         double zcx = (z.x0 + z.x1) / 2.0, zcy = (z.y0 + z.y1) / 2.0;
                         FindInsideAnchor(z.x0, z.y0, z.x1 - z.x0, z.y1 - z.y0,
                             zcx, zcy, cosA, sinA, surf1!, surf2!, out double zLx, out double zLy);
-                        AddCenteredText(trans, _o.VolumeLayerName,
+                        if (_o.ShowVolumeArea)
+                            PlaceVolumeAreaLabel(trans, Signed(zVol, _o.VolumePrecision),
+                                Area(zArea), _o.VolumeTextHeight, angle, _o.ColorVolume,
+                                z.x0, z.y0, z.x1 - z.x0, z.y1 - z.y0, zLx, zLy,
+                                PartPredicate(VolLabelKind.Cell, surf1, surf2));
+                        else
+                        PlaceVolumeLabel(AddCenteredText(trans, _o.VolumeLayerName,
                             LW(zLx, zLy, cosA, sinA),
                             Signed(zVol, _o.VolumePrecision),
                             _o.VolumeTextHeight, angle, _o.ColorVolume,
-                            hideMask: _o.HideMaskVolume);
+                            hideMask: _o.HideMaskVolume),
+                            z.x0, z.y0, z.x1 - z.x0, z.y1 - z.y0, zLx, zLy,
+                            PartPredicate(VolLabelKind.Cell, surf1, surf2), VolLabelKind.Cell);
 
                         double zDisp = double.Parse(
                             Math.Abs(zVol).ToString("F" + _o.VolumePrecision,
@@ -444,13 +527,14 @@ namespace KartogrammaPlugin
                     Report("Построение итоговой таблицы…", 92);
                     DrawSummaryTable(trans, aRows, aCols, cosA, sinA,
                         aColCut, aColFill, aRowCut, aRowFill, totCut, totFill,
-                        minR, minC, totalArea);
+                        minR, minC, totalArea, totalCutArea, totalFillArea,
+                        _o.HatchCut.Enabled, _o.HatchFill.Enabled);
                 }
 
                 Report("Фиксация транзакции…", 98);
                 trans.Commit();
 
-                ed.WriteMessage($"\n[Картограмма] Объём посчитан (шаг субсетки {_o.VolumeNodeStep:F3} м).");
+                ed.WriteMessage($"\n[Картограмма] Объём посчитан (шаг субсетки {StepText()} м).");
                 ed.WriteMessage($"\n[Картограмма] Выемка: -{totCut:F2} м³  |  Насыпь: +{totFill:F2} м³\n");
             }
             catch (Exception ex)
@@ -472,7 +556,8 @@ namespace KartogrammaPlugin
                 var ms = (BlockTableRecord)trans.GetObject(
                     bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
-                int n = EraseByLayer(trans, ms, _o.GridLayerName);
+                // Кресты ручных троек остаются вместе с тройками.
+                int n = EraseByLayer(trans, ms, _o.GridLayerName, e => !IsManualCross(e));
                 trans.Commit();
 
                 ed.WriteMessage($"\n[Картограмма] Удалено {n} объектов сетки.\n");
@@ -507,7 +592,9 @@ namespace KartogrammaPlugin
                       // по тем же ячейкам сетки — при удалении объёмов их тоже
                       // нужно убрать, иначе штриховка остаётся висеть без данных.
                       + EraseByLayer(trans, ms, _o.HatchLayerName)
-                      + EraseByLayer(trans, ms, _o.ZeroLineLayerName);
+                      + EraseByLayer(trans, ms, _o.ZeroLineLayerName)
+                      // Кресты ручных троек — на слое сетки, уходят с отметками.
+                      + EraseByLayer(trans, ms, _o.GridLayerName, IsManualCross);
                 trans.Commit();
 
                 ed.WriteMessage($"\n[Картограмма] Удалено {n} объектов (отметки + объёмы + штриховка).\n");
@@ -585,9 +672,10 @@ namespace KartogrammaPlugin
         //  узла origin (метки рисовались с известными смещениями) с допуском в
         //  долю высоты текста — надёжно даже в самом густом скоплении троек.
         //  Все три переносятся на target единым смещением (строй сохраняется),
-        //  рисуется линия-выноска, «+»-крестик под тройкой на новом месте и
-        //  малый крестик в исходной точке. Если хоть одна метка не найдена —
-        //  не переносится ничего (тройка ходит только целиком).
+        //  под тройкой на новом месте рисуется «+»-перекрестье по границам цифр
+        //  и линия-выноска к нему из ПЕРВОНАЧАЛЬНОГО узла (см. DrawCalloutMarker).
+        //  Если хоть одна метка не найдена — не переносится ничего (тройка
+        //  ходит только целиком).
         // ═══════════════════════════════════════════════════════════════════════
         public bool CreateLabelCallout(Point3d origin, Point3d target)
         {
@@ -654,74 +742,39 @@ namespace KartogrammaPlugin
                     return false;
                 }
 
-                var delta = target - origin;
-                foreach (var mt in nearest)
+                var delta = new Vector3d(target.X - origin.X, target.Y - origin.Y, 0);
+                var moved = new MText[3];
+                for (int i = 0; i < 3; i++)
                 {
-                    var w = (MText)trans.GetObject(mt!.ObjectId, OpenMode.ForWrite);
-                    w.Location = w.Location + delta;
+                    moved[i] = (MText)trans.GetObject(nearest[i]!.ObjectId, OpenMode.ForWrite);
+                    moved[i].Location = moved[i].Location + delta;
                 }
 
-                // Ручная тройка (DrawManualTriple) рисует под собой собственное
-                // перекрестье — две линии на слое рабочих отметок с серединой
-                // точно в узле. При переносе тройки старое перекрестье убираем,
-                // иначе на чертеже остаются два креста: старый в исходной точке
-                // и новый «+»-маркер на новом месте. Заодно снимаем «+»-маркер
-                // предыдущей выноски (слой таблицы) — повторный перенос той же
-                // тройки не копит кресты. Ищем по середине линии: у обеих линий
-                // перекрестья она совпадает с узлом; линии сетки живут на своём
-                // слое, а у линии-выноски середина в узле не лежит.
-                double crossTol = sh * 0.5;
-                var crossIds = new List<ObjectId>();
-                foreach (ObjectId id in ms)
-                {
-                    if (trans.GetObject(id, OpenMode.ForRead) is not Line ln) continue;
-                    if (ln.Layer != _o.WorkLayerName && ln.Layer != _o.TableLayerName) continue;
-                    double mx = (ln.StartPoint.X + ln.EndPoint.X) * 0.5;
-                    double my = (ln.StartPoint.Y + ln.EndPoint.Y) * 0.5;
-                    double dx = mx - origin.X, dy = my - origin.Y;
-                    if (Math.Sqrt(dx * dx + dy * dy) <= crossTol)
-                        crossIds.Add(id);
-                }
+                // Старое перекрестье в узле origin: «+»-маркер прошлой выноски
+                // (слой таблицы) или крест ручной тройки (слой сетки; в чертежах
+                // прошлых версий — слой рабочих отметок).
+                // И линия-выноска к нему. ПЕРВОНАЧАЛЬНЫЙ узел тройки и handle
+                // выноски хранятся в XData самих меток (пишется при каждом
+                // переносе), поэтому сколько ни переносить тройку, выноска идёт
+                // из одного и того же исходного узла. Поиск выноски по геометрии
+                // (её дальний конец — исходный узел) — только для троек,
+                // перенесённых прошлыми версиями без XData: он теряет узел, если
+                // тройку поставили рядом с исходным местом и выноска не рисовалась,
+                // или цепляет чужую линию слоя таблицы у края креста.
+                double nodeTol = sh * 0.1;
+                var lines    = CollectLines(trans, ms,
+                    _o.GridLayerName, _o.WorkLayerName, _o.TableLayerName);
+                var crossIds = lines.Where(l => PassesThroughNode(l.S, l.E, origin, nodeTol))
+                                    .Select(l => l.Id).ToList();
+                var leaderId = FindTripleLeader(moved, lines, crossIds, origin, nodeTol, out var anchor);
+                if (!leaderId.IsNull && !crossIds.Contains(leaderId)) crossIds.Add(leaderId);
                 foreach (var id in crossIds)
-                {
-                    var ln = (Line)trans.GetObject(id, OpenMode.ForWrite);
-                    ln.Erase();
-                }
+                    trans.GetObject(id, OpenMode.ForWrite).Erase();
 
-                // Линия-выноска из исходного узла к новому месту + «+»-маркер
-                // в новом месте (разделяет тройку на 3 квадранта как у узла
-                // сетки). В исходной точке никаких крестиков не рисуем: у тройки
-                // должно остаться ровно одно перекрестье — на новом месте, а
-                // исходную точку показывает начало линии-выноски.
-                double arm = _o.SmallTextHeight * 1.2;
-                double cA  = Math.Cos(_o.RotationRadians);
-                double sA  = Math.Sin(_o.RotationRadians);
-
-                var leader = new Line(origin, target)
-                {
-                    Layer = _o.TableLayerName,
-                    Color = Color.FromColorIndex(ColorMethod.ByAci, (short)_o.ColorTable)
-                };
-                var lineH = new Line(
-                    new Point3d(target.X - arm * cA, target.Y - arm * sA, 0),
-                    new Point3d(target.X + arm * cA, target.Y + arm * sA, 0))
-                {
-                    Layer = _o.TableLayerName,
-                    Color = Color.FromColorIndex(ColorMethod.ByAci, (short)_o.ColorTable)
-                };
-                var lineV = new Line(
-                    new Point3d(target.X + arm * sA, target.Y - arm * cA, 0),
-                    new Point3d(target.X - arm * sA, target.Y + arm * cA, 0))
-                {
-                    Layer = _o.TableLayerName,
-                    Color = Color.FromColorIndex(ColorMethod.ByAci, (short)_o.ColorTable)
-                };
-                ms.AppendEntity(leader);
-                ms.AppendEntity(lineH);
-                ms.AppendEntity(lineV);
-                trans.AddNewlyCreatedDBObject(leader, true);
-                trans.AddNewlyCreatedDBObject(lineH, true);
-                trans.AddNewlyCreatedDBObject(lineV, true);
+                var newLeader = DrawCalloutMarker(trans, ms, target,
+                    moved[0], moved[1], moved[2], anchor);
+                EnsureRegApp(trans);
+                WriteTripleCallout(moved, anchor, newLeader);
 
                 trans.Commit();
                 return true;
@@ -731,6 +784,478 @@ namespace KartogrammaPlugin
                 ed.WriteMessage($"\n[Картограмма] ОШИБКА выноски: {ex.Message}");
                 return false;
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Перекрестье тройки и линия-выноска — общие для выноски и перерисовки.
+        // ═══════════════════════════════════════════════════════════════════════
+        private static List<(ObjectId Id, Point3d S, Point3d E, string Layer)> CollectLines(
+            Transaction t, BlockTableRecord ms, params string[] layers)
+        {
+            var res = new List<(ObjectId Id, Point3d S, Point3d E, string Layer)>();
+            foreach (ObjectId id in ms)
+            {
+                if (t.GetObject(id, OpenMode.ForRead) is not Line ln) continue;
+                if (Array.IndexOf(layers, ln.Layer) < 0) continue;
+                res.Add((id, ln.StartPoint, ln.EndPoint, ln.Layer));
+            }
+            return res;
+        }
+
+        /// <summary>Отрезок — луч перекрестья узла: идёт по оси сетки, и узел
+        /// лежит на нём строго внутри (а не на конце, как у выноски).</summary>
+        private bool PassesThroughNode(Point3d s, Point3d e, Point3d node, double tol)
+        {
+            double dx = e.X - s.X, dy = e.Y - s.Y;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            if (len < 1e-9) return false;
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            bool alongX = Math.Abs(dx * sA - dy * cA) / len < 1e-3;
+            bool alongY = Math.Abs(dx * cA + dy * sA) / len < 1e-3;
+            if (!alongX && !alongY) return false;
+            double k = ((node.X - s.X) * dx + (node.Y - s.Y) * dy) / (len * len);
+            if (k * len <= tol || (1 - k) * len <= tol) return false;
+            double px = s.X + k * dx - node.X, py = s.Y + k * dy - node.Y;
+            return Math.Sqrt(px * px + py * py) <= tol;
+        }
+
+        /// <summary>Линия-выноска к перекрестью узла: отрезок слоя таблицы, один
+        /// конец которого лежит в узле (выноски старых версий шли в центр) или на
+        /// конце луча перекрестья. anchor — её дальний конец, первоначальный узел
+        /// тройки; если выноски нет — сам узел.</summary>
+        private ObjectId FindLeader(List<(ObjectId Id, Point3d S, Point3d E, string Layer)> lines,
+            List<ObjectId> crossIds, Point3d node, double tol, out Point3d anchor)
+        {
+            var ends = new List<Point3d> { node };
+            foreach (var l in lines)
+                if (crossIds.Contains(l.Id)) { ends.Add(l.S); ends.Add(l.E); }
+
+            static double D(Point3d a, Point3d b) =>
+                Math.Sqrt((a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y));
+
+            anchor = node;
+            var best = ObjectId.Null;
+            double bestD = double.MaxValue;
+            foreach (var l in lines)
+            {
+                if (l.Layer != _o.TableLayerName || crossIds.Contains(l.Id)) continue;
+                foreach (var p in ends)
+                {
+                    double dS = D(l.S, p), dE = D(l.E, p);
+                    double d  = Math.Min(dS, dE);
+                    if (d > tol || d >= bestD) continue;
+                    bestD  = d;
+                    best   = l.Id;
+                    anchor = dS <= dE ? l.E : l.S;
+                }
+            }
+            return best;
+        }
+
+        /// <summary>
+        /// «+»-перекрестье тройки по границам её цифр: горизонталь — от левого
+        /// края рабочей отметки до правого края самой широкой из проектной /
+        /// существующей, вертикаль — от низа существующей до верха верхних
+        /// отметок. Если задан anchor (первоначальный узел вынесенной тройки) —
+        /// ещё и линия-выноска из него к краю креста со стороны anchor: к нижнему
+        /// концу, если узел под крестом, иначе к левому или правому. Верхний
+        /// конец зажат между рабочей и проектной отметками и не используется.
+        /// </summary>
+        private ObjectId DrawTripleCross(Transaction t, BlockTableRecord ms, Point3d node,
+            MText work, MText design, MText exist, string layer, int aci, Point3d? anchor)
+        {
+            double sh = work.TextHeight, m = sh * 0.15;
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            double z  = work.Location.Z;
+
+            double xL = -(m + work.ActualWidth);
+            double xR =   m + Math.Max(design.ActualWidth, exist.ActualWidth);
+            double yB = -(m + sh);
+            double yT =   m + sh;
+
+            Point3d P(double lx, double ly) =>
+                new Point3d(node.X + lx * cA - ly * sA, node.Y + lx * sA + ly * cA, z);
+            ObjectId Add(Point3d a, Point3d b)
+            {
+                var ln = new Line(a, b)
+                {
+                    Layer = layer,
+                    Color = Color.FromColorIndex(ColorMethod.ByAci, (short)aci)
+                };
+                var id = ms.AppendEntity(ln);
+                t.AddNewlyCreatedDBObject(ln, true);
+                return id;
+            }
+
+            Add(P(xL, 0), P(xR, 0));
+            Add(P(0, yB), P(0, yT));
+            if (anchor == null) return ObjectId.Null;
+
+            double ox = anchor.Value.X - node.X, oy = anchor.Value.Y - node.Y;
+            double lxo =  ox * cA + oy * sA;   // в осях сетки
+            double lyo = -ox * sA + oy * cA;
+            bool inX = lxo >= xL && lxo <= xR;
+            // Тройку вернули на исходное место — выноска не нужна.
+            if (inX && lyo >= yB && lyo <= yT) return ObjectId.Null;
+
+            Point3d attach = lyo < 0 && inX ? P(0, yB)
+                           : lxo < 0        ? P(xL, 0)
+                           :                  P(xR, 0);
+            return Add(new Point3d(anchor.Value.X, anchor.Value.Y, z), attach);
+        }
+
+        /// <summary>Крест вынесенной тройки с выноской — слой и цвет таблицы.
+        /// Возвращает выноску (Null, если тройка стоит на исходном месте).</summary>
+        private ObjectId DrawCalloutMarker(Transaction t, BlockTableRecord ms, Point3d node,
+            MText work, MText design, MText exist, Point3d anchor) =>
+            DrawTripleCross(t, ms, node, work, design, exist,
+                _o.TableLayerName, _o.ColorTable, anchor);
+
+        /// <summary>Первоначальный узел вынесенной тройки и её выноска — из
+        /// XData меток (одинаковая у всех трёх; берётся первая найденная).
+        /// false — тройка ещё не переносилась или перенесена прошлой версией.</summary>
+        private bool TryReadTripleCallout(MText[] labels, out Point3d anchor, out ObjectId leaderId)
+        {
+            anchor   = Point3d.Origin;
+            leaderId = ObjectId.Null;
+            foreach (var mt in labels)
+            {
+                var rb = mt.GetXDataForApplication(XAppName);
+                if (rb == null) continue;
+                bool hasAnchor = false;
+                foreach (TypedValue tv in rb)
+                {
+                    if (tv.TypeCode == (int)DxfCode.ExtendedDataXCoordinate)
+                    {
+                        anchor    = (Point3d)tv.Value;
+                        hasAnchor = true;
+                    }
+                    else if (tv.TypeCode == (int)DxfCode.ExtendedDataHandle)
+                    {
+                        try
+                        {
+                            var h  = new Handle(Convert.ToInt64((string)tv.Value, 16));
+                            var id = _db.GetObjectId(false, h, 0);
+                            if (!id.IsNull && !id.IsErased) leaderId = id;
+                        }
+                        catch { }
+                    }
+                }
+                if (hasAnchor) return true;
+                leaderId = ObjectId.Null;
+            }
+            return false;
+        }
+
+        /// <summary>Первоначальный узел и текущая выноска вынесенной тройки.
+        /// Узел — из XData меток; без неё (тройка из прошлых версий) — по
+        /// геометрии (FindLeader). Выноска — по handle из XData; если её там
+        /// нет или она удалена (тройку переносили прошлой версией, которая
+        /// XData не обновляет) — отрезок у креста, идущий именно из этого узла.</summary>
+        private ObjectId FindTripleLeader(MText[] labels,
+            List<(ObjectId Id, Point3d S, Point3d E, string Layer)> lines,
+            List<ObjectId> crossIds, Point3d node, double tol, out Point3d anchor)
+        {
+            if (!TryReadTripleCallout(labels, out anchor, out var leaderId))
+                return FindLeader(lines, crossIds, node, tol, out anchor);
+            if (!leaderId.IsNull) return leaderId;
+
+            var geo = FindLeader(lines, crossIds, node, tol, out var geoAnchor);
+            double dx = geoAnchor.X - anchor.X, dy = geoAnchor.Y - anchor.Y;
+            return !geo.IsNull && Math.Sqrt(dx * dx + dy * dy) <= tol ? geo : ObjectId.Null;
+        }
+
+        private static void WriteTripleCallout(MText[] labels, Point3d anchor, ObjectId leaderId)
+        {
+            foreach (var mt in labels)
+            {
+                if (!mt.IsWriteEnabled) mt.UpgradeOpen();
+                WriteVolumeCallout(mt, anchor, leaderId);
+            }
+        }
+
+        /// <summary>Крест ручной тройки (DrawManualTriple): на слое сетки, цвет —
+        /// стандартный белый/чёрный AutoCAD (ACI 7), как узел сетки. Это
+        /// единственные отрезки (Line) на слое сетки — сама сетка из полилиний,
+        /// поэтому перестроение/удаление сетки их не трогает (IsManualCross), а
+        /// удаляются они вместе с отметками.</summary>
+        private void DrawManualCross(Transaction t, BlockTableRecord ms, Point3d node,
+            MText work, MText design, MText exist) =>
+            DrawTripleCross(t, ms, node, work, design, exist, _o.GridLayerName, 7, null);
+
+        private static bool IsManualCross(AcadEntity ent) => ent is Line;
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Выноска объёма. Подпись объёма ячейки переносится целиком, под ней
+        //  рисуется черта-подчёркивание по ширине цифры, а к ближнему концу
+        //  черты — линия из ПЕРВОНАЧАЛЬНОГО места подписи (одна полилиния).
+        //  Исходное место и handle полилинии хранятся в XData самой подписи:
+        //  при повторном переносе старая выноска удаляется, а новая снова идёт
+        //  из исходного места — без зигзагов.
+        // ═══════════════════════════════════════════════════════════════════════
+        public enum CalloutKind { None, Triple, Volume }
+
+        /// <summary>Расстояние от точки до прямоугольника текста в его
+        /// собственных осях (0 — точка внутри). Габариты GeometricExtents
+        /// для повёрнутого текста — описанный мировой прямоугольник, заметно
+        /// больше самих цифр, и соседние подписи в нём перекрываются.</summary>
+        private static double DistanceToText(MText mt, Point3d p)
+        {
+            double a = TextAngle(mt), c = Math.Cos(a), s = Math.Sin(a);
+            double dx0 = p.X - mt.Location.X, dy0 = p.Y - mt.Location.Y;
+            double u =  dx0 * c + dy0 * s;     // вдоль строки от точки вставки
+            double v = -dx0 * s + dy0 * c;
+            double w = mt.ActualWidth, h = mt.ActualHeight;
+            if (!(w > 0)) w = mt.Contents.Length * mt.TextHeight * 0.7;
+            if (!(h > 0)) h = mt.TextHeight;
+            (double u0, double v0) = mt.Attachment switch
+            {
+                AttachmentPoint.BottomRight  => (-w, 0.0),
+                AttachmentPoint.MiddleCenter => (-w / 2, -h / 2),
+                AttachmentPoint.TopLeft      => (0.0, -h),
+                _                            => (0.0, 0.0),
+            };
+            double du = Math.Max(0, Math.Max(u0 - u, u - (u0 + w)));
+            double dv = Math.Max(0, Math.Max(v0 - v, v - (v0 + h)));
+            return Math.Sqrt(du * du + dv * dv);
+        }
+
+        private const string XAppName = "OPENKARTOGRAMMA";
+
+        /// <summary>
+        /// Что пользователь указал для переноса: тройку отметок или подпись
+        /// объёма. picked — объект под курсором: если это цифра тройки или
+        /// объёма, берётся он. Иначе — ближайшая к клику подпись по её
+        /// собственному (повёрнутому) прямоугольнику; если клик внутри подписи
+        /// объёма, она важнее тройки под ней (объём лежит сверху).
+        /// basePt — откуда тянется резинка: узел тройки или центр подписи.
+        /// </summary>
+        public CalloutKind ClassifyCalloutPick(Point3d click, out Point3d basePt, out ObjectId volumeId,
+            ObjectId picked = default)
+        {
+            basePt   = click;
+            volumeId = ObjectId.Null;
+            bool isVolume = false;
+            try
+            {
+                using var trans = _db.TransactionManager.StartTransaction();
+                var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)trans.GetObject(
+                    bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                string[] layers = { _o.WorkLayerName, _o.DesignLayerName,
+                                    _o.ExistLayerName, _o.VolumeLayerName };
+                MText? best = null;
+
+                // Часть круга «Площадь и объём» (площадь, круг, черта) —
+                // переносится вся группа, берём её главный объект.
+                if (!picked.IsNull)
+                {
+                    var master = VolAreaMaster(trans.GetObject(picked, OpenMode.ForRead));
+                    if (!master.IsNull) picked = master;
+                }
+
+                if (!picked.IsNull && trans.GetObject(picked, OpenMode.ForRead) is MText pm &&
+                    Array.IndexOf(layers, pm.Layer) >= 0)
+                {
+                    best = pm;
+                    // Тройку дальше ищет FindTripletOrigin по точке — даём ему
+                    // точку вставки выбранной цифры, а не край, куда попал клик.
+                    if (pm.Layer != _o.VolumeLayerName) click = pm.Location;
+                }
+                else
+                {
+                    double bestD = double.MaxValue;
+                    bool bestInVolume = false;
+                    foreach (ObjectId id in ms)
+                    {
+                        if (trans.GetObject(id, OpenMode.ForRead) is not MText mt) continue;
+                        if (Array.IndexOf(layers, mt.Layer) < 0) continue;
+                        double d = DistanceToText(mt, click);
+                        bool inVolume = d <= 0 && mt.Layer == _o.VolumeLayerName;
+                        if (bestInVolume && !inVolume) continue;
+                        if ((inVolume && !bestInVolume) || d < bestD)
+                        { bestD = d; best = mt; bestInVolume = inVolume; }
+                    }
+                }
+                if (best == null) { trans.Commit(); return CalloutKind.None; }
+
+                isVolume = best.Layer == _o.VolumeLayerName;
+                if (isVolume)
+                {
+                    var master = VolAreaMaster(best);
+                    if (!master.IsNull) best = (MText)trans.GetObject(master, OpenMode.ForRead);
+                    basePt   = TryGetVolAreaGroup(trans, best, out _, out var circ, out _)
+                        ? circ.Center : best.Location;
+                    volumeId = best.ObjectId;
+                }
+                trans.Commit();
+            }
+            catch
+            {
+                return CalloutKind.None;
+            }
+            if (isVolume) return CalloutKind.Volume;
+
+            var node = FindTripletOrigin(click);
+            if (node == null) return CalloutKind.None;
+            basePt = node.Value;
+            return CalloutKind.Triple;
+        }
+
+        public bool CreateVolumeCallout(ObjectId labelId, Point3d target)
+        {
+            var ed = _doc.Editor;
+            try
+            {
+                using var trans = _db.TransactionManager.StartTransaction();
+                var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)trans.GetObject(
+                    bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+                EnsureRegApp(trans);
+
+                var mt = (MText)trans.GetObject(labelId, OpenMode.ForWrite);
+                ReadVolumeCallout(mt, out var anchor, out var leaderId);
+                if (!leaderId.IsNull) trans.GetObject(leaderId, OpenMode.ForWrite).Erase();
+
+                // Круг «Площадь и объём» — переносится целиком: объём,
+                // площадь, круг и черта; target — новый центр круга.
+                if (TryGetVolAreaGroup(trans, mt, out var area, out var circ, out var div))
+                {
+                    if (mt.GetXDataForApplication(XAppName) == null) anchor = circ.Center;
+                    var c0 = circ.Center;
+                    var move = Matrix3d.Displacement(new Point3d(target.X, target.Y, c0.Z) - c0);
+                    foreach (var e in new AcadEntity[] { mt, area, circ, div })
+                    {
+                        if (!e.IsWriteEnabled) e.UpgradeOpen();
+                        e.TransformBy(move);
+                    }
+                    WriteVolumeCallout(mt, anchor, DrawVolumeAreaLeader(trans, ms, circ, div, anchor));
+                    trans.Commit();
+                    return true;
+                }
+
+                mt.Location = new Point3d(target.X, target.Y, mt.Location.Z);
+                var plId = DrawVolumeLeader(trans, ms, mt, anchor);
+                WriteVolumeCallout(mt, anchor, plId);
+
+                trans.Commit();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ed.WriteMessage($"\n[Картограмма] ОШИБКА выноски объёма: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>После смены высоты/стиля текста — выноски объёмов заново
+        /// по новой ширине цифр, из того же исходного места.</summary>
+        private void RefitVolumeCallouts()
+        {
+            using var trans = _db.TransactionManager.StartTransaction();
+            var rat = (RegAppTable)trans.GetObject(_db.RegAppTableId, OpenMode.ForRead);
+            if (!rat.Has(XAppName)) { trans.Commit(); return; }
+
+            var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)trans.GetObject(
+                bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var ids = new List<ObjectId>();
+            foreach (ObjectId id in ms)
+                if (trans.GetObject(id, OpenMode.ForRead) is MText mt &&
+                    mt.Layer == _o.VolumeLayerName &&
+                    mt.GetXDataForApplication(XAppName) != null)
+                    ids.Add(id);
+
+            foreach (var id in ids)
+            {
+                var mt = (MText)trans.GetObject(id, OpenMode.ForWrite);
+                ReadVolumeCallout(mt, out var anchor, out var leaderId);
+                if (!leaderId.IsNull) trans.GetObject(leaderId, OpenMode.ForWrite).Erase();
+                var plId = TryGetVolAreaGroup(trans, mt, out _, out var circ, out var div)
+                    ? DrawVolumeAreaLeader(trans, ms, circ, div, anchor)
+                    : DrawVolumeLeader(trans, ms, mt, anchor);
+                WriteVolumeCallout(mt, anchor, plId);
+            }
+            trans.Commit();
+        }
+
+        private void ReadVolumeCallout(MText mt, out Point3d anchor, out ObjectId leaderId)
+        {
+            anchor   = mt.Location;   // ещё не переносилась — исходное место здесь
+            leaderId = ObjectId.Null;
+            var rb = mt.GetXDataForApplication(XAppName);
+            if (rb == null) return;
+            foreach (TypedValue tv in rb)
+            {
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataXCoordinate)
+                    anchor = (Point3d)tv.Value;
+                else if (tv.TypeCode == (int)DxfCode.ExtendedDataHandle)
+                {
+                    try
+                    {
+                        var h  = new Handle(Convert.ToInt64((string)tv.Value, 16));
+                        var id = _db.GetObjectId(false, h, 0);
+                        if (!id.IsNull && !id.IsErased) leaderId = id;
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private static void WriteVolumeCallout(MText mt, Point3d anchor, ObjectId leaderId)
+        {
+            var rb = new ResultBuffer(
+                new TypedValue((int)DxfCode.ExtendedDataRegAppName, XAppName),
+                new TypedValue((int)DxfCode.ExtendedDataXCoordinate, anchor));
+            if (!leaderId.IsNull)
+                rb.Add(new TypedValue((int)DxfCode.ExtendedDataHandle, leaderId.Handle.ToString()));
+            mt.XData = rb;
+        }
+
+        /// <summary>
+        /// Полилиния выноски объёма: исходное место → ближний к нему конец
+        /// черты под цифрой → дальний конец. Черта — по ширине цифры с малым
+        /// запасом, чуть ниже текста. Если подпись вернули на исходное место
+        /// (оно под самой цифрой) — выноска не нужна, возвращает Null.
+        /// </summary>
+        private ObjectId DrawVolumeLeader(Transaction t, BlockTableRecord ms, MText mt, Point3d anchor)
+        {
+            double h    = mt.TextHeight;
+            double half = mt.ActualWidth * 0.5 + h * 0.15;
+            double uy   = -(Math.Max(mt.ActualHeight, h) * 0.5 + h * 0.2);
+            double c = Math.Cos(TextAngle(mt)), s = Math.Sin(TextAngle(mt));
+            var o = mt.Location;   // MiddleCenter — центр цифры
+            Point2d P(double lx, double ly) =>
+                new Point2d(o.X + lx * c - ly * s, o.Y + lx * s + ly * c);
+
+            double ox = anchor.X - o.X, oy = anchor.Y - o.Y;
+            double ax =  ox * c + oy * s;
+            double ay = -ox * s + oy * c;
+            if (Math.Abs(ax) <= half && Math.Abs(ay) <= -uy) return ObjectId.Null;
+
+            var pl = new Polyline();
+            pl.SetDatabaseDefaults();
+            pl.AddVertexAt(0, new Point2d(anchor.X, anchor.Y), 0, 0, 0);
+            pl.AddVertexAt(1, ax < 0 ? P(-half, uy) : P(half, uy), 0, 0, 0);
+            pl.AddVertexAt(2, ax < 0 ? P(half, uy) : P(-half, uy), 0, 0, 0);
+            pl.Elevation = o.Z;
+            pl.Layer = _o.VolumeLayerName;
+            pl.Color = Color.FromColorIndex(ColorMethod.ByAci, (short)_o.ColorVolume);
+            ms.AppendEntity(pl);
+            t.AddNewlyCreatedDBObject(pl, true);
+            return pl.ObjectId;
+        }
+
+        private void EnsureRegApp(Transaction t)
+        {
+            var rat = (RegAppTable)t.GetObject(_db.RegAppTableId, OpenMode.ForRead);
+            if (rat.Has(XAppName)) return;
+            rat.UpgradeOpen();
+            var rec = new RegAppTableRecord { Name = XAppName };
+            rat.Add(rec);
+            t.AddNewlyCreatedDBObject(rec, true);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -764,6 +1289,7 @@ namespace KartogrammaPlugin
                 EnsureLayer(trans, _o.WorkLayerName,   _o.ColorWork);
                 EnsureLayer(trans, _o.ExistLayerName,  _o.ColorExisting);
                 EnsureLayer(trans, _o.DesignLayerName, _o.ColorDesign);
+                EnsureLayer(trans, _o.GridLayerName,   7);   // крест тройки
 
                 var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
                 _ms = (BlockTableRecord)trans.GetObject(
@@ -784,48 +1310,28 @@ namespace KartogrammaPlugin
                 double work   = e2.Value - e1.Value;
 
                 // Рабочая — справа-налево, выше и левее точки
-                AddRightAlignedText(trans, _o.WorkLayerName,
+                var mtWork = AddRightAlignedText(trans, _o.WorkLayerName,
                     LW(nx - margin, ny + margin, cA, sA),
                     Signed(work, _o.TextPrecision), sh, ang, _o.ColorWork, _o.HideMaskText);
 
                 // Проектная — слева-направо, выше и правее точки
-                AddTextToLayer(trans, _o.DesignLayerName,
+                var mtDesign = AddTextToLayer(trans, _o.DesignLayerName,
                     LW(nx + margin, ny + margin, cA, sA),
-                    e2.Value.ToString(fmt), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText);
+                    Num(e2.Value, _o.TextPrecision), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText);
 
                 // Существующая — слева-направо, ниже и правее точки
-                AddTextToLayer(trans, _o.ExistLayerName,
+                var mtExist = AddTextToLayer(trans, _o.ExistLayerName,
                     LW(nx + margin, ny - margin - sh, cA, sA),
-                    e1.Value.ToString(fmt), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText);
+                    Num(e1.Value, _o.TextPrecision), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText);
 
-                // Крестик-маркер точки — как «+»-маркер выноски, по углу сетки.
-                // Кладём на слой рабочих отметок (живёт и удаляется вместе с
-                // тройкой), но цвет — стандартный белый/чёрный AutoCAD (ACI 7),
-                // чтобы крестик читался как узел сетки, а не как рабочая отметка.
-                double arm = sh * 1.2;
-                var lineH = new Line(
-                    new Point3d(pt.X - arm * cA, pt.Y - arm * sA, 0),
-                    new Point3d(pt.X + arm * cA, pt.Y + arm * sA, 0))
-                {
-                    Layer = _o.WorkLayerName,
-                    Color = Color.FromColorIndex(ColorMethod.ByAci, 7)
-                };
-                var lineV = new Line(
-                    new Point3d(pt.X + arm * sA, pt.Y - arm * cA, 0),
-                    new Point3d(pt.X - arm * sA, pt.Y + arm * cA, 0))
-                {
-                    Layer = _o.WorkLayerName,
-                    Color = Color.FromColorIndex(ColorMethod.ByAci, 7)
-                };
-                _ms.AppendEntity(lineH);
-                _ms.AppendEntity(lineV);
-                trans.AddNewlyCreatedDBObject(lineH, true);
-                trans.AddNewlyCreatedDBObject(lineV, true);
+                // Крест-маркер точки по границам цифр, по углу сетки
+                // (в узлах сетки его роль играют линии сетки).
+                DrawManualCross(trans, _ms, LW(nx, ny, cA, sA), mtWork, mtDesign, mtExist);
 
                 trans.Commit();
                 ed.WriteMessage(
-                    $"\n[Картограмма] Тройка: чёрная {e1.Value.ToString(fmt)}, " +
-                    $"красная {e2.Value.ToString(fmt)}, рабочая {Signed(work, _o.TextPrecision)}");
+                    $"\n[Картограмма] Тройка: чёрная {Num(e1.Value, _o.TextPrecision)}, " +
+                    $"красная {Num(e2.Value, _o.TextPrecision)}, рабочая {Signed(work, _o.TextPrecision)}");
                 return true;
             }
             catch (Exception ex)
@@ -882,6 +1388,11 @@ namespace KartogrammaPlugin
                                 : lay == _o.DesignLayerName ? _o.ColorDesign
                                 : lay == _o.ExistLayerName  ? _o.ColorExisting
                                 :                              _o.ColorVolume;
+                        if (ent is MText lbl && lay != _o.TextLayerName)
+                        {
+                            AlignToGrid(lbl);
+                            ShiftNodeLabel(lbl, lay, _o.SmallTextHeight);
+                        }
                         if (UpdateTextEntity(ent, _o.SmallTextHeight, aci, textTsId))
                             updated++;
                         continue;
@@ -892,8 +1403,16 @@ namespace KartogrammaPlugin
                     {
                         if (ent is DBText || ent is MText)
                         {
+                            if (ent is MText vol) AlignToGrid(vol);
                             if (UpdateTextEntity(ent, _o.VolumeTextHeight, _o.ColorVolume, textTsId))
                                 updated++;
+                        }
+                        else if (ent is Circle || ent is Polyline)
+                        {
+                            // Круги «Площадь и объём», их черты и выноски
+                            ent.UpgradeOpen();
+                            ent.ColorIndex = _o.ColorVolume;
+                            updated++;
                         }
                         continue;
                     }
@@ -909,6 +1428,7 @@ namespace KartogrammaPlugin
                         }
                         if (ent is DBText || ent is MText)
                         {
+                            if (ent is MText tt) AlignToGrid(tt);
                             if (UpdateTextEntity(ent, _o.TableTextHeight, _o.ColorTable, tableTsId))
                                 updated++;
                         }
@@ -916,6 +1436,15 @@ namespace KartogrammaPlugin
                 }
 
                 trans.Commit();
+
+                // Кресты троек подгоняем уже по новым размерам цифр — в отдельной
+                // транзакции, чтобы ширина MText была пересчитана после смены
+                // высоты и стиля.
+                RefitTripleMarkers();
+                // Подписи объёмов — заново без наездов на тройки под новый шрифт.
+                RelayoutVolumeLabels();
+                RefitVolumeCallouts();
+                RebuildSummaryTables();
                 ed.WriteMessage($"\n[Картограмма] Обновлено {updated} объектов (внешний вид).");
             }
             catch (Exception ex)
@@ -925,11 +1454,24 @@ namespace KartogrammaPlugin
             return updated;
         }
 
+        /// <summary>Повернуть подпись по углу сетки в мировых осях. Чертежи,
+        /// рассчитанные при повёрнутой ПСК прошлыми версиями, получили угол
+        /// от ПСК (MText.Rotation) — точка вставки у них верная, неверен
+        /// только поворот. Атташмент сохраняется, поэтому подпись остаётся
+        /// на своём месте у узла.</summary>
+        private void AlignToGrid(MText mt)
+        {
+            var dir = TextDir(_o.RotationRadians);
+            if (mt.Direction.IsParallelTo(dir) && mt.Direction.DotProduct(dir) > 0) return;
+            if (!mt.IsWriteEnabled) mt.UpgradeOpen();
+            mt.Direction = dir;
+        }
+
         private static bool UpdateTextEntity(
             Autodesk.AutoCAD.DatabaseServices.Entity ent,
             double height, int aci, ObjectId textStyleId)
         {
-            ent.UpgradeOpen();
+            if (!ent.IsWriteEnabled) ent.UpgradeOpen();
             ent.ColorIndex = aci;
             if (ent is DBText dbt)
             {
@@ -944,6 +1486,116 @@ namespace KartogrammaPlugin
                 return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Метки тройки стоят со смещениями от узла, зависящими от высоты текста
+        /// (зазор 0.15·h, существующая ещё на h ниже). При смене высоты одна
+        /// лишь TextHeight оставила бы точку вставки на старом месте — новая
+        /// крупная цифра наезжала бы на узел и соседние метки. Поэтому
+        /// пересчитываем точку вставки от того же узла под новую высоту; узел
+        /// при этом не меняется, так что вынесенные тройки остаются на месте.
+        /// Вызывается ДО смены TextHeight.
+        /// </summary>
+        private void ShiftNodeLabel(MText mt, string layer, double newH)
+        {
+            double dH = newH - mt.TextHeight;
+            if (Math.Abs(dH) < 1e-9) return;
+            bool isWork = layer == _o.WorkLayerName;
+            if (mt.Attachment != (isWork ? AttachmentPoint.BottomRight : AttachmentPoint.BottomLeft))
+                return;
+
+            double dm = dH * 0.15;
+            double lx = isWork ? -dm : dm;
+            double ly = layer == _o.ExistLayerName ? -dm - dH : dm;
+            double c = Math.Cos(TextAngle(mt)), s = Math.Sin(TextAngle(mt));
+            if (!mt.IsWriteEnabled) mt.UpgradeOpen();
+            mt.Location = mt.Location + new Vector3d(lx * c - ly * s, lx * s + ly * c, 0);
+        }
+
+        /// <summary>
+        /// После смены высоты текста подгоняет кресты троек под новые цифры:
+        /// и крест выноски (с выноской из того же первоначального узла), и
+        /// крест ручной тройки — по границам цифр.
+        /// </summary>
+        private void RefitTripleMarkers()
+        {
+            using var trans = _db.TransactionManager.StartTransaction();
+            var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)trans.GetObject(
+                bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var lines = CollectLines(trans, ms,
+                _o.GridLayerName, _o.WorkLayerName, _o.TableLayerName);
+            if (lines.Count == 0) { trans.Commit(); return; }
+
+            var works   = new List<MText>();
+            var designs = new List<MText>();
+            var exists  = new List<MText>();
+            foreach (ObjectId id in ms)
+            {
+                if (trans.GetObject(id, OpenMode.ForRead) is not MText mt) continue;
+                if      (mt.Layer == _o.WorkLayerName)   works.Add(mt);
+                else if (mt.Layer == _o.DesignLayerName) designs.Add(mt);
+                else if (mt.Layer == _o.ExistLayerName)  exists.Add(mt);
+            }
+
+            MText? Nearest(List<MText> list, Point3d p, double tol)
+            {
+                MText? best = null;
+                double bestD = tol;
+                foreach (var mt in list)
+                {
+                    double d = (mt.Location - p).Length;
+                    if (d <= bestD) { bestD = d; best = mt; }
+                }
+                return best;
+            }
+
+            foreach (var w in works)
+            {
+                if (w.Attachment != AttachmentPoint.BottomRight) continue;
+                double sh = w.TextHeight, m = sh * 0.15;
+                double c = Math.Cos(TextAngle(w)), s = Math.Sin(TextAngle(w));
+                Point3d L(double lx, double ly) => new Point3d(
+                    w.Location.X + lx * c - ly * s, w.Location.Y + lx * s + ly * c, w.Location.Z);
+                var node = L(m, -m);   // рабочая стоит в (−m, +m) от узла
+                double tol = sh * 0.1;
+
+                // Крест ручной тройки: слой сетки (или рабочих — прошлые версии)
+                var wCross = lines.Where(l => l.Layer != _o.TableLayerName &&
+                                              PassesThroughNode(l.S, l.E, node, tol))
+                                  .Select(l => l.Id).ToList();
+                var tCross = lines.Where(l => l.Layer == _o.TableLayerName &&
+                                              PassesThroughNode(l.S, l.E, node, tol))
+                                  .Select(l => l.Id).ToList();
+                if (wCross.Count == 0 && tCross.Count == 0) continue;
+
+                var d = Nearest(designs, L(2 * m, 0), tol);            // узел + (m, m)
+                var e = Nearest(exists,  L(2 * m, -2 * m - sh), tol);  // узел + (m, −m−sh)
+                if (d == null || e == null) continue;
+
+                if (wCross.Count > 0)
+                {
+                    foreach (var id in wCross) trans.GetObject(id, OpenMode.ForWrite).Erase();
+                    lines.RemoveAll(l => wCross.Contains(l.Id));
+                    DrawManualCross(trans, ms, node, w, d, e);
+                }
+
+                if (tCross.Count > 0)
+                {
+                    var triple   = new[] { w, d, e };
+                    var leaderId = FindTripleLeader(triple, lines, tCross, node, tol, out var anchor);
+                    var gone = new List<ObjectId>(tCross);
+                    if (!leaderId.IsNull && !gone.Contains(leaderId)) gone.Add(leaderId);
+                    foreach (var id in gone) trans.GetObject(id, OpenMode.ForWrite).Erase();
+                    lines.RemoveAll(l => gone.Contains(l.Id));
+                    var newLeader = DrawCalloutMarker(trans, ms, node, w, d, e, anchor);
+                    EnsureRegApp(trans);
+                    WriteTripleCallout(triple, anchor, newLeader);
+                }
+            }
+            trans.Commit();
         }
 
         private static bool UpdateTableEntity(
@@ -1381,14 +2033,47 @@ namespace KartogrammaPlugin
         //  Для субтреугольников на границе (часть вершин — NaN) выполняется
         //  бинарный поиск точки пересечения границы и считается частичный объём.
         // ═══════════════════════════════════════════════════════════════════════
+        /// <summary>Предел узлов субсетки на сторону ячейки: 400² узлов —
+        /// ещё быстро. Шаг мельче — точный расчёт по треугольникам TIN.</summary>
+        private const int MaxSubgridN = 400;
+        private int _exactVolCells, _cappedVolCells;
+
+        /// <summary>Сколько узлов на сторону ячейки просит шаг субсетки.</summary>
+        private long SubgridWanted() => Math.Max(4L, (long)Math.Min(1e15, Math.Ceiling(
+            Math.Max(_o.CellSizeX, _o.CellSizeY) / Math.Max(_o.VolumeNodeStep, 1e-9))));
+
+        private string StepText() => _o.VolumeNodeStep.ToString("0.######",
+            System.Globalization.CultureInfo.InvariantCulture);
+
         private double CalcCellVolumeAccurate(int r, int c,
             CivilSurface s1, CivilSurface s2, double cosA, double sinA, out double cellArea,
-            out double volFill, out double volCut)
+            out double volFill, out double volCut,
+            out double areaFill, out double areaCut)
         {
             double szX = _o.CellSizeX;
             double szY = _o.CellSizeY;
 
-            int    n  = Math.Max(4, (int)Math.Ceiling(Math.Max(szX, szY) / _o.VolumeNodeStep));
+            // Шаг мельче, чем позволяет субсетка (вплоть до микрона): объём —
+            // точно по треугольникам обеих TIN, это предел субсетки при шаге,
+            // стремящемся к нулю. Где точный путь неприменим — субсетка с
+            // ограниченным числом узлов.
+            long nWant = SubgridWanted();
+            if (nWant > MaxSubgridN)
+            {
+                var ex = CellTouchesAnomalyZone(c * szX, r * szY, szX, szY)
+                    ? null : ExactCellSplit(c * szX, r * szY, cosA, sinA);
+                if (ex != null)
+                {
+                    System.Threading.Interlocked.Increment(ref _exactVolCells);
+                    cellArea = ex.Area;
+                    volFill  = ex.FillVolume;  volCut  = ex.CutVolume;
+                    areaFill = ex.FillArea;    areaCut = ex.CutArea;
+                    return volFill + volCut;
+                }
+                System.Threading.Interlocked.Increment(ref _cappedVolCells);
+            }
+
+            int    n  = (int)Math.Max(4, Math.Min(nWant, MaxSubgridN));
             double dx = szX / n;
             double dy = szY / n;
 
@@ -1425,6 +2110,8 @@ namespace KartogrammaPlugin
             cellArea   = 0.0;
             volFill    = 0.0;
             volCut     = 0.0;
+            areaFill   = 0.0;
+            areaCut    = 0.0;
 
             for (int si = 0; si < n; si++)
             for (int sj = 0; sj < n; sj++)
@@ -1434,20 +2121,26 @@ namespace KartogrammaPlugin
                     wx[si,   sj  ], wy[si,   sj  ], h[si,   sj  ],
                     wx[si,   sj+1], wy[si,   sj+1], h[si,   sj+1],
                     wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ],
-                    out double aBL, out double fBL, out double cBL);
+                    out double aBL, out double fBL, out double cBL,
+                    out double afBL, out double acBL);
                 cellArea += aBL;
                 volFill  += fBL;
                 volCut   += cBL;
+                areaFill += afBL;
+                areaCut  += acBL;
 
                 // Верхний правый треугольник: BR, TR, TL
                 vol += CalcSubTriVol(s1, s2,
                     wx[si,   sj+1], wy[si,   sj+1], h[si,   sj+1],
                     wx[si+1, sj+1], wy[si+1, sj+1], h[si+1, sj+1],
                     wx[si+1, sj  ], wy[si+1, sj  ], h[si+1, sj  ],
-                    out double aTR, out double fTR, out double cTR);
+                    out double aTR, out double fTR, out double cTR,
+                    out double afTR, out double acTR);
                 cellArea += aTR;
                 volFill  += fTR;
                 volCut   += cTR;
+                areaFill += afTR;
+                areaCut  += acTR;
             }
 
             return vol;
@@ -1461,11 +2154,14 @@ namespace KartogrammaPlugin
         // ═══════════════════════════════════════════════════════════════════════
         private double CalcCellVolumeSquares(int r, int c,
             CivilSurface s1, CivilSurface s2, double cosA, double sinA,
-            out double volFill, out double volCut)
+            out double volFill, out double volCut,
+            out double areaFill, out double areaCut)
         {
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
-            volFill = 0.0;
-            volCut  = 0.0;
+            volFill  = 0.0;
+            volCut   = 0.0;
+            areaFill = 0.0;
+            areaCut  = 0.0;
 
             // Рабочие отметки в 4 углах ячейки. Порядок обхода (00 → 01 → 11 → 10)
             // нужен для разделения по нулевой линии — оно идёт по контуру клетки.
@@ -1529,13 +2225,14 @@ namespace KartogrammaPlugin
             if (cnt == 4 && ZeroLineSplit.IsMixed(hc))
             {
                 ZeroLineSplit.Quad(effArea, hc[0], hc[1], hc[2], hc[3],
-                    out volFill, out volCut, out _, out _);
+                    out volFill, out volCut, out areaFill, out areaCut);
                 return volFill + volCut;
             }
 
             // Однородная клетка — сальдо не меняется, оно же и есть объём
             // своего знака.
-            if (vol >= 0) volFill = vol; else volCut = vol;
+            if (vol >= 0) { volFill = vol; areaFill = effArea; }
+            else          { volCut  = vol; areaCut  = effArea; }
             return vol;
         }
 
@@ -1581,11 +2278,14 @@ namespace KartogrammaPlugin
             double xA, double yA, double hA,
             double xB, double yB, double hB,
             double xC, double yC, double hC,
-            out double area, out double volFill, out double volCut)
+            out double area, out double volFill, out double volCut,
+            out double areaFill, out double areaCut)
         {
             area = 0.0;
             volFill = 0.0;
             volCut  = 0.0;
+            areaFill = 0.0;
+            areaCut  = 0.0;
             bool aOk = !double.IsNaN(hA);
             bool bOk = !double.IsNaN(hB);
             bool cOk = !double.IsNaN(hC);
@@ -1602,7 +2302,7 @@ namespace KartogrammaPlugin
                 // Разделение по нулевой линии — только для подписи и итогов;
                 // возвращаемое сальдо считается прежней формулой без изменений.
                 ZeroLineSplit.Triangle(fullArea, hA, hB, hC,
-                    out volFill, out volCut, out _, out _);
+                    out volFill, out volCut, out areaFill, out areaCut);
                 return fullArea * (hA + hB + hC) / 3.0;
             }
 
@@ -1627,11 +2327,13 @@ namespace KartogrammaPlugin
                 area = a1 + a2;
 
                 ZeroLineSplit.Triangle(a1, hP, hV1, hV2,
-                    out double f1, out double c1, out _, out _);
+                    out double f1, out double c1, out double af1, out double ac1);
                 ZeroLineSplit.Triangle(a2, hP, hV2, hQ,
-                    out double f2, out double c2, out _, out _);
-                volFill = f1 + f2;
-                volCut  = c1 + c2;
+                    out double f2, out double c2, out double af2, out double ac2);
+                volFill  = f1 + f2;
+                volCut   = c1 + c2;
+                areaFill = af1 + af2;
+                areaCut  = ac1 + ac2;
 
                 return a1 * (hP + hV1 + hV2) / 3.0
                      + a2 * (hP + hV2 + hQ) / 3.0;
@@ -1653,7 +2355,7 @@ namespace KartogrammaPlugin
                 // Валидная область: треугольник V-P-Q
                 area = TriArea2D(xV, yV, pX, pY, qX, qY);
                 ZeroLineSplit.Triangle(area, hV, hP, hQ,
-                    out volFill, out volCut, out _, out _);
+                    out volFill, out volCut, out areaFill, out areaCut);
                 return area * (hV + hP + hQ) / 3.0;
             }
 
@@ -1952,6 +2654,23 @@ namespace KartogrammaPlugin
             return (n % 2 == 0) ? n : n + 1;
         }
 
+        // Плотность выборки контуров штриховки и линии нулевых работ — шаг
+        // расчёта объёмов (VolumeNodeStep), чтобы штриховка делила ячейку так
+        // же, как объёмы: узкий перешеек выемки между двумя пятнами насыпи не
+        // проскакивает между узлами. Плотно сэмплируются только ячейки на
+        // нулевой линии/краю — однородные штрихуются прямоугольником.
+        /// <summary>Допуск края штриховки и линии нулевых работ: между узлами
+        /// выборки край уточняется по изломам TIN до 1 мкм.</summary>
+        private const double ExactEdgeTol = 1e-6;
+
+        private int HatchSampleSteps()
+        {
+            int n = (int)Math.Ceiling(
+                Math.Max(_o.CellSizeX, _o.CellSizeY) / Math.Max(_o.VolumeNodeStep, 1e-6));
+            n = Clamp(n, 4, 120);
+            return n + (n & 1);
+        }
+
         /// <summary>
         /// Контуры ячейки (r, c), обрезанной по краю зоны данных, в координатах UCS.
         /// null — обрезать нечего: ячейка целиком в зоне данных (или контур
@@ -1984,7 +2703,8 @@ namespace KartogrammaPlugin
                 if (!HasData(j * szX / Coarse, i * szY / Coarse)) allInside = false;
             if (allInside) return null;
 
-            var fill = CellClipper.Clip(szX, szY, ClipSampleSteps(), 12, HasData, out var loops);
+            var fill = CellClipper.Clip(szX, szY, ClipSampleSteps(), CellClipper.EdgeRefineSteps,
+                HasData, out var loops);
             if (fill != CellClipper.CellFill.Partial) return null;
 
             var res = new List<List<Point2d>>(loops.Count);
@@ -2014,8 +2734,12 @@ namespace KartogrammaPlugin
         //  Ничего не вычисляет: объёмы, отметки и таблица уже посчитаны и от
         //  штриховки не зависят.
         // ═══════════════════════════════════════════════════════════════════════
+        /// <param name="signAreas">Площади насыпной и выемочной частей ячеек
+        /// из расчёта объёмов (ключ — строка, колонка): точный признак того,
+        /// что в ячейке есть оба знака, даже если грубая разведка их не видит.</param>
         private void DrawHatchAndZeroLine(Transaction t, int rows, int cols,
-            double cA, double sA, CivilSurface s1, CivilSurface s2)
+            double cA, double sA, CivilSurface s1, CivilSurface s2,
+            Dictionary<(int, int), (double Fill, double Cut)>? signAreas = null)
         {
             bool wantFill = _o.HatchFill.Enabled;
             bool wantCut  = _o.HatchCut.Enabled;
@@ -2023,15 +2747,63 @@ namespace KartogrammaPlugin
             if (!wantFill && !wantCut && !wantZero) return;
 
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
-            int    steps = ClipSampleSteps();
+            int    steps = HatchSampleSteps();
+            // Пятно меньше этого (доля площади ячейки) — шум численного
+            // интегрирования у нулевой линии, вторым знаком не считаем.
+            double minSignArea = szX * szY * 1e-4;
             var    ltId  = ResolveLinetype(t, _o.ZeroLine.LineType);
             bool   errorReported = false;
-            int    hatches = 0, zeroChains = 0;
+            int    hatches = 0, zeroChains = 0, hatchFallbacks = 0, exactCells = 0;
+            var    mismatches = new List<string>();
+
+            void DrawZeroChain(List<(double X, double Y)> chain, double x0, double y0)
+            {
+                if (chain.Count < 2) return;
+                var pl = new Polyline();
+                for (int k = 0; k < chain.Count; k++)
+                    pl.AddVertexAt(k,
+                        ToUcs2d(LW(x0 + chain[k].X, y0 + chain[k].Y, cA, sA)),
+                        0, 0, 0);
+                pl.Layer = _o.ZeroLineLayerName;
+                pl.Color = Color.FromColorIndex(
+                    ColorMethod.ByAci, (short)_o.ZeroLine.ColorAci);
+                if (!ltId.IsNull) pl.LinetypeId = ltId;
+                pl.LineWeight = ToLineWeight(_o.ZeroLine.LineWeight);
+                _ms.AppendEntity(pl);
+                t.AddNewlyCreatedDBObject(pl, true);
+                zeroChains++;
+            }
+
+            // Сверка: заштрихованная площадь против площадей насыпи и
+            // выемки из расчёта объёмов (они по той же поверхности).
+            // Ячейки с зонами перепадов пропускаем — зоны из объёмов
+            // ячейки вырезаны, а штриховка их покрывает.
+            void CheckAreas(int r, int c, double x0, double y0, double hFill, double hCut)
+            {
+                if (signAreas == null || !signAreas.TryGetValue((r, c), out var chk) ||
+                    CellTouchesAnomalyZone(x0, y0, szX, szY)) return;
+                double tol = Math.Max(0.01, szX * szY * 0.005);
+                if (wantFill && Math.Abs(hFill - chk.Fill) > tol)
+                    mismatches.Add($"строка {r + 1}, колонка {c + 1}: насыпь — штриховка {hFill:F3} м², расчёт {chk.Fill:F3} м²");
+                if (wantCut && Math.Abs(hCut - chk.Cut) > tol)
+                    mismatches.Add($"строка {r + 1}, колонка {c + 1}: выемка — штриховка {hCut:F3} м², расчёт {chk.Cut:F3} м²");
+            }
+
+            // Точное разделение ячеек — чистые вычисления по снимкам TIN
+            // (потокобезопасны), считаем заранее по всем ядрам.
+            TinOverlay.Result?[]? exactAll = null;
+            if (_snap1 != null && _snap2 != null)
+            {
+                Report("Штриховка: точное разделение по треугольникам TIN…", 90);
+                exactAll = new TinOverlay.Result?[rows * cols];
+                System.Threading.Tasks.Parallel.For(0, rows * cols, k =>
+                    exactAll[k] = ExactCellSplit((k % cols) * szX, (k / cols) * szY, cA, sA));
+            }
 
             for (int r = 0; r < rows; r++)
             {
                 if ((r & 3) == 0)
-                    Report($"Штриховка… {r}/{rows}", 5 + (int)(3.0 * r / Math.Max(rows, 1)));
+                    Report($"Штриховка… {r}/{rows}", 90 + (int)(1.0 * r / Math.Max(rows, 1)));
 
                 for (int c = 0; c < cols; c++)
                 {
@@ -2041,6 +2813,27 @@ namespace KartogrammaPlugin
                         !CellHasOverlap(r, c, s1, s2, cA, sA, DenseOverlapSteps())) continue;
 
                     double x0 = c * szX, y0 = r * szY;
+
+                    // Точно — по треугольникам обеих TIN, без выборки (до долей
+                    // микрона, узкие пятна не теряются). Если нельзя (не TIN,
+                    // ячейка на заданной границе, вырожденная склейка) — ниже
+                    // прежний расчёт по выборке.
+                    var exact = exactAll?[r * cols + c];
+                    if (exact != null)
+                    {
+                        exactCells++;
+                        double eFill = 0, eCut = 0;
+                        if (wantFill && exact.Fill.Count > 0 &&
+                            AddHatch(t, CellLoopsToUcs(exact.Fill, x0, y0, cA, sA), _o.HatchFill, ref errorReported))
+                        { hatches++; eFill = exact.FillArea; }
+                        if (wantCut && exact.Cut.Count > 0 &&
+                            AddHatch(t, CellLoopsToUcs(exact.Cut, x0, y0, cA, sA), _o.HatchCut, ref errorReported))
+                        { hatches++; eCut = exact.CutArea; }
+                        if (wantZero)
+                            foreach (var chain in exact.Zero) DrawZeroChain(chain, x0, y0);
+                        CheckAreas(r, c, x0, y0, eFill, eCut);
+                        continue;
+                    }
 
                     // Рабочая отметка в локальных координатах ячейки.
                     // NaN — работ здесь нет: либо нет данных одной из
@@ -2071,41 +2864,132 @@ namespace KartogrammaPlugin
                         else if (h < 0)      nNeg++;
                     }
 
-                    if (wantFill && nPos > 0 &&
-                        DrawSignHatch(t, x0, y0, cA, sA, steps, H, true,
-                            nNeg == 0 && nNan == 0, _o.HatchFill, ref errorReported))
-                        hatches++;
-
-                    if (wantCut && nNeg > 0 &&
-                        DrawSignHatch(t, x0, y0, cA, sA, steps, H, false,
-                            nPos == 0 && nNan == 0, _o.HatchCut, ref errorReported))
-                        hatches++;
-
-                    if (wantZero && nPos > 0 && nNeg > 0)
+                    // Уточнение по расчёту объёмов: пятно второго знака между
+                    // точками разведки (островок насыпи в выемке) иначе
+                    // осталось бы незамеченным, и ячейку целиком залила бы
+                    // штриховка первого знака — прямо поверх островка.
+                    bool anyPos = nPos > 0, anyNeg = nNeg > 0;
+                    bool fillDominant = nPos >= nNeg;
+                    if (signAreas != null && signAreas.TryGetValue((r, c), out var sa))
                     {
-                        foreach (var chain in ZeroContour.Trace(szX, szY, steps, H))
-                        {
-                            if (chain.Count < 2) continue;
-                            var pl = new Polyline();
-                            for (int k = 0; k < chain.Count; k++)
-                                pl.AddVertexAt(k,
-                                    ToUcs2d(LW(x0 + chain[k].X, y0 + chain[k].Y, cA, sA)),
-                                    0, 0, 0);
-                            pl.Layer = _o.ZeroLineLayerName;
-                            pl.Color = Color.FromColorIndex(
-                                ColorMethod.ByAci, (short)_o.ZeroLine.ColorAci);
-                            if (!ltId.IsNull) pl.LinetypeId = ltId;
-                            pl.LineWeight = ToLineWeight(_o.ZeroLine.LineWeight);
-                            _ms.AppendEntity(pl);
-                            t.AddNewlyCreatedDBObject(pl, true);
-                            zeroChains++;
-                        }
+                        if (sa.Fill > minSignArea) anyPos = true;
+                        if (sa.Cut  > minSignArea) anyNeg = true;
+                        if (sa.Fill + sa.Cut > 0) fillDominant = sa.Fill >= sa.Cut;
                     }
+
+                    // dominant — знак, которого в ячейке больше: если контур его
+                    // части не построился, ячейка штрихуется им целиком (только
+                    // одним знаком — две штриховки не наложатся). Только для
+                    // ячеек без края данных/границы — иначе целый квадрат
+                    // вылез бы за контур.
+                    double hFill = 0, hCut = 0;
+                    if (wantFill && anyPos &&
+                        DrawSignHatch(t, x0, y0, cA, sA, steps, H, true,
+                            !anyNeg && nNan == 0, nNan == 0 && fillDominant, _o.HatchFill,
+                            ref errorReported, ref hatchFallbacks, out hFill))
+                        hatches++;
+
+                    if (wantCut && anyNeg &&
+                        DrawSignHatch(t, x0, y0, cA, sA, steps, H, false,
+                            !anyPos && nNan == 0, nNan == 0 && !fillDominant, _o.HatchCut,
+                            ref errorReported, ref hatchFallbacks, out hCut))
+                        hatches++;
+
+                    CheckAreas(r, c, x0, y0, hFill, hCut);
+
+                    if (wantZero && anyPos && anyNeg)
+                        foreach (var chain in ZeroContour.Trace(szX, szY, steps, H, ExactEdgeTol))
+                            DrawZeroChain(chain, x0, y0);
                 }
             }
 
             _doc.Editor.WriteMessage(
-                $"\n[Картограмма] Штриховка: {hatches} контуров, линия нулевых работ: {zeroChains} сегментов");
+                $"\n[Картограмма] Штриховка: {hatches} контуров, линия нулевых работ: {zeroChains} сегментов" +
+                $" (точно по треугольникам TIN: {exactCells} ячеек)");
+            if (hatchFallbacks > 0)
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] Штриховка: в {hatchFallbacks} ячейк(ах) контур не построился — заштрихованы целиком преобладающим знаком");
+            if (mismatches.Count > 0)
+            {
+                _doc.Editor.WriteMessage(
+                    $"\n[Картограмма] Сверка штриховки с площадями объёмов: расхождение в {mismatches.Count} случа(ях):");
+                foreach (var m in mismatches.Take(30))
+                    _doc.Editor.WriteMessage("\n    " + m);
+                if (mismatches.Count > 30)
+                    _doc.Editor.WriteMessage($"\n    … и ещё {mismatches.Count - 30}");
+            }
+            else if (signAreas != null && (wantFill || wantCut))
+                _doc.Editor.WriteMessage(
+                    "\n[Картограмма] Сверка штриховки с площадями объёмов: расхождений нет");
+        }
+
+        /// <summary>
+        /// Точное разделение ячейки на насыпь/выемку по треугольникам обеих TIN
+        /// (TinOverlay). null — точный путь неприменим: нет снимков TIN, ячейка
+        /// задевает заданную границу (обрезку по ней ведёт выборка), или склейка
+        /// не сошлась.
+        /// </summary>
+        private TinOverlay.Result? ExactCellSplit(double x0, double y0, double cA, double sA)
+        {
+            if (_snap1 == null || _snap2 == null) return null;
+            try { return ExactCellSplitCore(x0, y0, cA, sA); }
+            catch { return null; }
+        }
+
+        private TinOverlay.Result? ExactCellSplitCore(double x0, double y0, double cA, double sA)
+        {
+            double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            var cw = new[]
+            {
+                LW(x0, y0, cA, sA), LW(x0 + szX, y0, cA, sA),
+                LW(x0 + szX, y0 + szY, cA, sA), LW(x0, y0 + szY, cA, sA),
+            };
+            if (_boundaryPts != null || _innerPtsList != null)
+            {
+                var corners = cw.Select(p => new Point2d(p.X, p.Y)).ToArray();
+                if (_boundaryPts != null && ClassifyCell(corners, _boundaryPts) != CellClass.Inside)
+                    return null;
+                if (_innerPtsList != null)
+                    foreach (var ip in _innerPtsList)
+                        if (ClassifyCell(corners, ip) != CellClass.Outside) return null;
+            }
+
+            double mnX = cw.Min(p => p.X), mxX = cw.Max(p => p.X);
+            double mnY = cw.Min(p => p.Y), mxY = cw.Max(p => p.Y);
+            List<TinOverlay.Tri> Local(TinSnapshot snap)
+            {
+                var l = new List<TinOverlay.Tri>();
+                double LX(double wx, double wy) => (wx - _o.BaseX) * cA + (wy - _o.BaseY) * sA - x0;
+                double LY(double wx, double wy) => -(wx - _o.BaseX) * sA + (wy - _o.BaseY) * cA - y0;
+                snap.ForEachTriangle(mnX, mnY, mxX, mxY, (ax, ay, az, bx, by, bz, qx, qy, qz) =>
+                    l.Add(new TinOverlay.Tri(
+                        LX(ax, ay), LY(ax, ay), az,
+                        LX(bx, by), LY(bx, by), bz,
+                        LX(qx, qy), LY(qx, qy), qz)));
+                return l;
+            }
+            return TinOverlay.Build(szX, szY, Local(_snap1!), Local(_snap2!));
+        }
+
+        private List<List<Point2d>> CellLoopsToUcs(List<List<(double X, double Y)>> loops,
+            double x0, double y0, double cA, double sA)
+        {
+            var res = new List<List<Point2d>>(loops.Count);
+            foreach (var loop in loops)
+            {
+                var pts = new List<Point2d>(loop.Count);
+                foreach (var p in loop) pts.Add(ToUcs2d(LW(x0 + p.X, y0 + p.Y, cA, sA)));
+                res.Add(pts);
+            }
+            return res;
+        }
+
+        private bool CellTouchesAnomalyZone(double x0, double y0, double w, double h)
+        {
+            if (_anomalyZones == null) return false;
+            foreach (var z in _anomalyZones)
+                if (z.x1 > x0 && z.x0 < x0 + w && z.y1 > y0 && z.y0 < y0 + h) return true;
+            return false;
         }
 
         /// <summary>
@@ -2114,22 +2998,15 @@ namespace KartogrammaPlugin
         /// </summary>
         private bool DrawSignHatch(Transaction t, double x0, double y0,
             double cA, double sA, int steps, Func<double, double, double> h,
-            bool positive, bool wholeCell, HatchSpec spec, ref bool errorReported)
+            bool positive, bool wholeCell, bool dominant, HatchSpec spec,
+            ref bool errorReported, ref int fallbacks, out double hatchedArea)
         {
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
+            hatchedArea = 0;
             var loops = new List<List<Point2d>>();
+            bool partialDone = false;
 
-            if (wholeCell)
-            {
-                loops.Add(new List<Point2d>
-                {
-                    ToUcs2d(LW(x0,       y0,       cA, sA)),
-                    ToUcs2d(LW(x0 + szX, y0,       cA, sA)),
-                    ToUcs2d(LW(x0 + szX, y0 + szY, cA, sA)),
-                    ToUcs2d(LW(x0,       y0 + szY, cA, sA)),
-                });
-            }
-            else
+            if (!wholeCell)
             {
                 bool Pred(double lx, double ly)
                 {
@@ -2138,21 +3015,47 @@ namespace KartogrammaPlugin
                     return positive ? v > 0 : v < 0;
                 }
 
-                var fill = CellClipper.Clip(szX, szY, steps, 12, Pred, out var raw);
-                // Full здесь означает вырожденную сшивку (целую ячейку отсеяла
-                // грубая разведка выше) — штриховать наугад не станем.
-                if (fill != CellClipper.CellFill.Partial || raw.Count == 0) return false;
-
-                foreach (var loop in raw)
+                // Full здесь — либо плотная выборка вся этого знака (грубая
+                // разведка зацепила мелкое пятно другого знака), либо
+                // вырожденная сшивка контура. Ячейку без края данных не
+                // оставляем пустой: её целиком берёт преобладающий знак.
+                var fill = CellClipper.Clip(szX, szY, steps, CellClipper.EdgeRefineSteps,
+                    Pred, out var raw, ExactEdgeTol);
+                if (fill == CellClipper.CellFill.Partial && raw.Count > 0)
                 {
-                    var pts = new List<Point2d>(loop.Count);
-                    foreach (var p in loop)
-                        pts.Add(ToUcs2d(LW(x0 + p.X, y0 + p.Y, cA, sA)));
-                    loops.Add(pts);
+                    foreach (var loop in raw)
+                    {
+                        var pts = new List<Point2d>(loop.Count);
+                        foreach (var p in loop)
+                            pts.Add(ToUcs2d(LW(x0 + p.X, y0 + p.Y, cA, sA)));
+                        loops.Add(pts);
+                        // Контуры ориентированы: внешние — против часовой (+),
+                        // дырки — по часовой (−); сумма — площадь области.
+                        hatchedArea += CellClipper.Area(loop);
+                    }
+                    partialDone = true;
                 }
+                else if (fill == CellClipper.CellFill.Empty || !dominant)
+                    return false;
+                else
+                    fallbacks++;
             }
 
-            return AddHatch(t, loops, spec, ref errorReported);
+            if (!partialDone)
+            {
+                hatchedArea = szX * szY;
+                loops.Add(new List<Point2d>
+                {
+                    ToUcs2d(LW(x0,       y0,       cA, sA)),
+                    ToUcs2d(LW(x0 + szX, y0,       cA, sA)),
+                    ToUcs2d(LW(x0 + szX, y0 + szY, cA, sA)),
+                    ToUcs2d(LW(x0,       y0 + szY, cA, sA)),
+                });
+            }
+
+            bool ok = AddHatch(t, loops, spec, ref errorReported);
+            if (!ok) hatchedArea = 0;
+            return ok;
         }
 
         /// <summary>Создать объект штриховки AutoCAD по готовым контурам.</summary>
@@ -2525,15 +3428,15 @@ namespace KartogrammaPlugin
                 double margin  = sh * 0.15;
                 double work    = e2.Value - e1.Value;
 
-                AddRightAlignedText(t, _o.WorkLayerName,
+                RecordLabelBox(AddRightAlignedText(t, _o.WorkLayerName,
                     LW(lx - margin, ly + margin, cA, sA),
-                    Signed(work, _o.TextPrecision), sh, ang, workAci, _o.HideMaskText);
-                AddTextToLayer(t, _o.DesignLayerName,
+                    Signed(work, _o.TextPrecision), sh, ang, workAci, _o.HideMaskText));
+                RecordLabelBox(AddTextToLayer(t, _o.DesignLayerName,
                     LW(lx + margin, ly + margin, cA, sA),
-                    e2.Value.ToString(fmt), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText);
-                AddTextToLayer(t, _o.ExistLayerName,
+                    Num(e2.Value, _o.TextPrecision), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText));
+                RecordLabelBox(AddTextToLayer(t, _o.ExistLayerName,
                     LW(lx + margin, ly - margin - sh, cA, sA),
-                    e1.Value.ToString(fmt), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText);
+                    Num(e1.Value, _o.TextPrecision), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText));
             }
 
             void ProcessPolygon(List<Point2d> pts)
@@ -2752,19 +3655,19 @@ namespace KartogrammaPlugin
             double work    = e2.Value - e1.Value;
 
             // Рабочая — справа-налево, выше и левее узла
-            AddRightAlignedText(t, _o.WorkLayerName,
+            RecordLabelBox(AddRightAlignedText(t, _o.WorkLayerName,
                 LW(nx - margin, ny + margin, cA, sA),
-                Signed(work, _o.TextPrecision), sh, ang, workAci, _o.HideMaskText);
+                Signed(work, _o.TextPrecision), sh, ang, workAci, _o.HideMaskText));
 
             // Проектная — слева-направо, выше и правее узла
-            AddTextToLayer(t, _o.DesignLayerName,
+            RecordLabelBox(AddTextToLayer(t, _o.DesignLayerName,
                 LW(nx + margin, ny + margin, cA, sA),
-                e2.Value.ToString(fmt), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText);
+                Num(e2.Value, _o.TextPrecision), sh, ang, _o.ColorDesign, hideMask: _o.HideMaskText));
 
             // Существующая — слева-направо, ниже и правее узла
-            AddTextToLayer(t, _o.ExistLayerName,
+            RecordLabelBox(AddTextToLayer(t, _o.ExistLayerName,
                 LW(nx + margin, ny - margin - sh, cA, sA),
-                e1.Value.ToString(fmt), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText);
+                Num(e1.Value, _o.TextPrecision), sh, ang, _o.ColorExisting, hideMask: _o.HideMaskText));
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -2776,10 +3679,25 @@ namespace KartogrammaPlugin
             double[] rowCut, double[] rowFill,
             double totCut, double totFill,
             int rowOffset = 0, int colOffset = 0,
-            double totalArea = 0)
+            double totalArea = 0, double cutArea = 0, double fillArea = 0,
+            bool showCutLine = false, bool showFillLine = false)
         {
             var ed  = _doc.Editor;
             double szX = _o.CellSizeX, szY = _o.CellSizeY;
+
+            // Исходные данные таблицы — PlaceTable сохранит их в самой таблице,
+            // чтобы «Перерисовать» мог перестроить её под новый шрифт без
+            // пересчёта объёмов (см. RebuildSummaryTables).
+            var data = new List<double>
+            {
+                SummaryDataVersion, rows, cols, rowOffset, colOffset,
+                totCut, totFill, totalArea, _o.BaseX, _o.BaseY,
+                cutArea, fillArea, showCutLine ? 1 : 0, showFillLine ? 1 : 0
+            };
+            data.AddRange(colCut); data.AddRange(colFill);
+            data.AddRange(rowCut); data.AddRange(rowFill);
+            _summaryData = data.ToArray();
+
             // Высота шрифта таблицы — ровно как задал пользователь: все ячейки,
             // кроме колонок данных (они привязаны к шагу сетки), верстаются
             // «впритык» к тексту и масштабируются пропорционально шрифту.
@@ -2795,7 +3713,21 @@ namespace KartogrammaPlugin
             double gridWidth  = cols * szX;
             double gridHeight = rows * szY;
 
-            string areaText  = $"Площадь: {totalArea:F2} м²  насыпь: +{totFill:F2} м³  выемка: –{totCut:F2} м³";
+            // Первая строка — всегда; строки выемки/насыпи — только если
+            // при расчёте была включена соответствующая штриховка.
+            var areaLines = new List<string>
+            {
+                $"Площадь: {Num(totalArea)} м²  насыпь: +{Num(totFill)} м³  выемка: –{Num(totCut)} м³"
+            };
+            if (showCutLine)
+                areaLines.Add($"Площадь выемки: {Num(cutArea)} м²  объём выемки: –{Num(totCut)} м³");
+            if (showFillLine)
+                areaLines.Add($"Площадь насыпи: {Num(fillArea)} м²  объём насыпи: +{Num(totFill)} м³");
+            // Каждая строка — отдельный MText, привязанный низом; строки идут
+            // вниз от первой. Там, где подпись стоит ПОД таблицей, опускаем её
+            // низ на высоту добавочных строк — первая строка остаётся на месте.
+            double lineGap    = sh * 5.0 / 3.0;
+            double extraLines = (areaLines.Count - 1) * lineGap;
 
             int pos = _o.TablePosition;
             string[] posNames = { "Сверху", "Снизу", "Слева", "Справа" };
@@ -2819,13 +3751,13 @@ namespace KartogrammaPlugin
                 double pad = sh * 0.6;   // «воздух»: по 0.3 высоты текста с каждой стороны
 
                 // Строки значений нужны заранее — по самым длинным меряется ширина колонок
-                string sFillTot = totFill > 0.001 ? "+" + totFill.ToString("F2") : "–";
-                string sCutTot  = totCut  > 0.001 ? "–" + totCut.ToString("F2")  : "–";
+                string sFillTot = totFill > 0.001 ? "+" + Num(totFill) : "–";
+                string sCutTot  = totCut  > 0.001 ? "–" + Num(totCut)  : "–";
                 string longFill = sFillTot, longCut = sCutTot;
                 for (int gr = 0; gr < rows; gr++)
                 {
-                    string fs = rowFill[gr] > 0.001 ? "+" + rowFill[gr].ToString("F2") : "–";
-                    string cs = rowCut[gr]  > 0.001 ? "–" + rowCut[gr].ToString("F2")  : "–";
+                    string fs = rowFill[gr] > 0.001 ? "+" + Num(rowFill[gr]) : "–";
+                    string cs = rowCut[gr]  > 0.001 ? "–" + Num(rowCut[gr])  : "–";
                     if (fs.Length > longFill.Length) longFill = fs;
                     if (cs.Length > longCut.Length)  longCut  = cs;
                 }
@@ -2833,8 +3765,8 @@ namespace KartogrammaPlugin
                 // ── Точная вёрстка по фактической ширине текста ──────────────
                 // Ширину таблицы задают: самая длинная цифра в колонке (впритык)
                 // и горизонтальные «Итого, м³»/«Всего, м³» на две колонки.
-                double wItog  = MeasureTextWidth(t, "Итого, м³", sh);
-                double wVsego = MeasureTextWidth(t, "Всего, м³", sh);
+                double wItog  = MeasureTextWidth(t, ItogoM3, sh) + sh * 0.2;   // небольшой запас
+                double wVsego = MeasureTextWidth(t, VsegoM3, sh) + sh * 0.2;
                 double colW   = Math.Max(
                     Math.Max(MeasureTextWidth(t, longFill, sh),
                              MeasureTextWidth(t, longCut,  sh)) + pad,
@@ -2877,8 +3809,8 @@ namespace KartogrammaPlugin
                 for (int k = 0; k < rows; k++)
                 {
                     int gr = rows - 1 - k;
-                    string fs = rowFill[gr] > 0.001 ? "+" + rowFill[gr].ToString("F2") : "–";
-                    string cs = rowCut[gr]  > 0.001 ? "–" + rowCut[gr].ToString("F2")  : "–";
+                    string fs = rowFill[gr] > 0.001 ? "+" + Num(rowFill[gr]) : "–";
+                    string cs = rowCut[gr]  > 0.001 ? "–" + Num(rowCut[gr])  : "–";
                     SetCell(tbl, iData0 + k, 0, fs, sh, CellAlignment.MiddleCenter, tc);
                     SetCell(tbl, iData0 + k, 1, cs, sh, CellAlignment.MiddleCenter, tc);
                 }
@@ -2898,8 +3830,8 @@ namespace KartogrammaPlugin
                 for (int r = 0; r < tblRows; r++) tbl.Rows[r].Height = rowHeights[r];
 
                 // Заполнить мержнутые строки и установить вертикальный текст заголовков
-                SetCell(tbl, iItog,  0, "Итого, м³", sh, CellAlignment.MiddleCenter, tc);
-                SetCell(tbl, iVsego, 0, "Всего, м³", sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, iItog,  0, ItogoM3, sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, iVsego, 0, VsegoM3, sh, CellAlignment.MiddleCenter, tc);
                 SetCell(tbl, iLabel, 0, "Насыпь", sh, CellAlignment.MiddleCenter, tc);
                 tbl.Cells[iLabel, 0].Contents[0].Rotation = Math.PI * 0.5;
                 SetCell(tbl, iLabel, 1, "Выемка", sh, CellAlignment.MiddleCenter, tc);
@@ -2926,10 +3858,8 @@ namespace KartogrammaPlugin
                 PlaceTable(t, tbl, tblLocalX, tblLocalY, tableW, tblH, cA, sA);
 
                 // Текст итогов — ниже таблицы
-                double txtY = offY - (vsegoH + totalH + sh * 1.5);
-                AddTextToLayer(t, _o.TableLayerName,
-                    LW(tblLocalX, txtY, cA, sA), areaText, sh, ang, tc, _tblTsId,
-                    hideMask: _o.HideMaskTable);
+                double txtY = offY - (vsegoH + totalH + sh * 1.5) - extraLines;
+                AddSummaryLines(t, tblLocalX, txtY, areaLines, sh, ang, tc, lineGap, cA, sA);
 
                 ed.WriteMessage($"\n[Таблица] Вертикальная: {tblRows}×{tblCols} (itogo+label+data+vsego+total)");
                 ed.WriteMessage($"\n[Таблица] ════════════════════════════════════════════\n");
@@ -2947,14 +3877,14 @@ namespace KartogrammaPlugin
                 double pad = sh * 0.6;   // «воздух»: по 0.3 высоты текста с каждой стороны
 
                 // Итоговые строки нужны заранее — по ним меряется ширина ячеек
-                string sFillTot = totFill > 0.001 ? "+" + totFill.ToString("F2") : "–";
-                string sCutTot  = totCut  > 0.001 ? "–" + totCut.ToString("F2")  : "–";
+                string sFillTot = totFill > 0.001 ? "+" + Num(totFill) : "–";
+                string sCutTot  = totCut  > 0.001 ? "–" + Num(totCut)  : "–";
 
                 // ── Точная вёрстка по фактической ширине текста ──────────────
                 // Высоту таблицы задаёт ВЕРТИКАЛЬНОЕ «Итого, м³»: две строки
                 // делят его длину пополам — текст помещается впритык.
-                double wItog  = MeasureTextWidth(t, "Итого, м³", sh);
-                double wVsego = MeasureTextWidth(t, "Всего, м³", sh);
+                double wItog  = MeasureTextWidth(t, ItogoM3, sh) + sh * 0.2;   // небольшой запас
+                double wVsego = MeasureTextWidth(t, VsegoM3, sh) + sh * 0.2;
                 double rH     = (Math.Max(wItog, wVsego) + pad) / 2.0;
                 double tblH   = 2.0 * rH;
 
@@ -2998,7 +3928,7 @@ namespace KartogrammaPlugin
                 SetCell(tbl, 0, iLabel, "Насыпь", sh, CellAlignment.MiddleCenter, tc);
                 for (int c = 0; c < cols; c++)
                 {
-                    string val = colFill[c] > 0.001 ? "+" + colFill[c].ToString("F2") : "–";
+                    string val = colFill[c] > 0.001 ? "+" + Num(colFill[c]) : "–";
                     SetCell(tbl, 0, iData0 + c, val, sh, CellAlignment.MiddleCenter, tc);
                 }
                 SetCell(tbl, 0, iTotal, sFillTot, sh, CellAlignment.MiddleCenter, tc);
@@ -3007,7 +3937,7 @@ namespace KartogrammaPlugin
                 SetCell(tbl, 1, iLabel, "Выемка", sh, CellAlignment.MiddleCenter, tc);
                 for (int c = 0; c < cols; c++)
                 {
-                    string val = colCut[c] > 0.001 ? "–" + colCut[c].ToString("F2") : "–";
+                    string val = colCut[c] > 0.001 ? "–" + Num(colCut[c]) : "–";
                     SetCell(tbl, 1, iData0 + c, val, sh, CellAlignment.MiddleCenter, tc);
                 }
                 SetCell(tbl, 1, iTotal, sCutTot, sh, CellAlignment.MiddleCenter, tc);
@@ -3023,9 +3953,9 @@ namespace KartogrammaPlugin
                 for (int r = 0; r < tblRows; r++) tbl.Rows[r].Height = rH;
 
                 // Заполнить мержнутые ячейки и применить поворот текста
-                SetCell(tbl, 0, iItog,  "Итого, м³", sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, 0, iItog,  ItogoM3, sh, CellAlignment.MiddleCenter, tc);
                 tbl.Cells[0, iItog].Contents[0].Rotation  = Math.PI * 0.5;
-                SetCell(tbl, 0, iVsego, "Всего, м³", sh, CellAlignment.MiddleCenter, tc);
+                SetCell(tbl, 0, iVsego, VsegoM3, sh, CellAlignment.MiddleCenter, tc);
                 tbl.Cells[0, iVsego].Contents[0].Rotation = Math.PI * 0.5;
 
                 // Контрольное восстановление размеров: заполнение ячеек и поворот
@@ -3040,7 +3970,7 @@ namespace KartogrammaPlugin
                 if (pos == 1) // Снизу
                 {
                     tblLocalY = offY - gap;
-                    txtLocalY = offY - gap - tblH - sh * 1.5;
+                    txtLocalY = offY - gap - tblH - sh * 1.5 - extraLines;
                 }
                 else // Сверху (pos == 0)
                 {
@@ -3061,9 +3991,7 @@ namespace KartogrammaPlugin
                 PlaceTable(t, tbl, tblLocalX, tblLocalY, tblWfull, tblH, cA, sA);
 
                 // ── Текст итогов под/над таблицей ──────────────────────────────────
-                AddTextToLayer(t, _o.TableLayerName,
-                    LW(tblLocalX, txtLocalY, cA, sA), areaText, sh, ang, tc, _tblTsId,
-                    hideMask: _o.HideMaskTable);
+                AddSummaryLines(t, tblLocalX, txtLocalY, areaLines, sh, ang, tc, lineGap, cA, sA);
 
                 ed.WriteMessage($"\n[Таблица] Горизонтальная: 2×{tblCols} (itogo+label+data+vsego+total)");
                 ed.WriteMessage($"\n[Таблица] ════════════════════════════════════════════\n");
@@ -3077,8 +4005,15 @@ namespace KartogrammaPlugin
         /// (ширины букв различаются у разных стилей). Используется для точной
         /// вёрстки итоговой таблицы «впритык» к тексту при любом размере шрифта.
         /// </summary>
+        // Заголовки таблицы — с обычным юникодным «³», как принято на картограммах.
+        private const string ItogoM3 = "Итого, м³";
+        private const string VsegoM3 = "Всего, м³";
+
         private double MeasureTextWidth(Transaction t, string text, double height)
         {
+            double w = 0;
+            // DBText не понимает коды форматирования MText — меряем только MText
+            if (text.IndexOf('\\') < 0)
             try
             {
                 var txt = new DBText { TextString = text, Height = height };
@@ -3087,11 +4022,28 @@ namespace KartogrammaPlugin
                 _ms.AppendEntity(txt);
                 t.AddNewlyCreatedDBObject(txt, true);
                 var ext = txt.GeometricExtents;
-                double w = ext.MaxPoint.X - ext.MinPoint.X;
+                w = ext.MaxPoint.X - ext.MinPoint.X;
                 txt.Erase();
-                return w;
             }
-            catch { return text.Length * height * 0.62; }   // грубая оценка по числу знаков
+            catch { w = text.Length * height * 0.62; }   // грубая оценка по числу знаков
+
+            // В ячейке таблицы текст рисуется как MText, а не DBText. Символы,
+            // которых нет в SHX-шрифте стиля (например «³» в «м³»), MText берёт
+            // из шрифта-замены, и они выходят шире, чем у DBText, — «Всего, м³»
+            // вылезал за границу ячейки. Меряем и так, и так, берём большее.
+            try
+            {
+                var mt = new MText { Contents = text, TextHeight = height, Width = 0 };
+                mt.SetDatabaseDefaults();
+                if (!_tblTsId.IsNull) mt.TextStyleId = _tblTsId;
+                _ms.AppendEntity(mt);
+                t.AddNewlyCreatedDBObject(mt, true);
+                w = Math.Max(w, mt.ActualWidth);
+                mt.Erase();
+            }
+            catch { }
+            if (w <= 0) w = text.Length * height * 0.62;   // грубая оценка по числу знаков
+            return w;
         }
 
         /// <summary>Создать таблицу с отключённым авто-подгоном размеров</summary>
@@ -3153,6 +4105,7 @@ namespace KartogrammaPlugin
             {
                 _ms.AppendEntity(tbl);
                 t.AddNewlyCreatedDBObject(tbl, true);
+                SaveSummaryData(t, tbl);
                 return;
             }
 
@@ -3191,6 +4144,7 @@ namespace KartogrammaPlugin
             t.AddNewlyCreatedDBObject(wo, true);
             btr.AppendEntity(tbl);
             t.AddNewlyCreatedDBObject(tbl, true);
+            SaveSummaryData(t, tbl);
 
             // Геометрия уже в WCS → вставляем блок в начало координат без смещения.
             var br = new BlockReference(Point3d.Origin, btrId);
@@ -3204,6 +4158,125 @@ namespace KartogrammaPlugin
                 _ms.DrawOrderTableId, OpenMode.ForWrite);
             var brIds = new ObjectIdCollection { br.ObjectId };
             dot.MoveToTop(brIds);
+        }
+
+        // ── Данные итоговой таблицы внутри неё самой (словарь расширений) ────────
+        private const string SummaryDataKey     = "OPENKARTOGRAMMA_SUMMARY";
+        // v1: 10 полей заголовка; v2: + площади выемки/насыпи и флаги их строк.
+        private const double SummaryDataVersion = 2;
+        private static int SummaryHeaderLength(double version) => version == 1 ? 10 : 14;
+        private double[]? _summaryData;
+
+        private void SaveSummaryData(Transaction t,
+            Autodesk.AutoCAD.DatabaseServices.Table tbl)
+        {
+            if (_summaryData == null) return;
+            tbl.CreateExtensionDictionary();
+            var dict = (DBDictionary)t.GetObject(tbl.ExtensionDictionary, OpenMode.ForWrite);
+            var rb = new ResultBuffer();
+            foreach (double v in _summaryData)
+                rb.Add(new TypedValue((int)DxfCode.Real, v));
+            var xr = new Xrecord { Data = rb };
+            dict.SetAt(SummaryDataKey, xr);
+            t.AddNewlyCreatedDBObject(xr, true);
+        }
+
+        private static double[]? LoadSummaryData(Transaction t,
+            Autodesk.AutoCAD.DatabaseServices.Table tbl)
+        {
+            if (tbl.ExtensionDictionary.IsNull) return null;
+            var dict = (DBDictionary)t.GetObject(tbl.ExtensionDictionary, OpenMode.ForRead);
+            if (!dict.Contains(SummaryDataKey)) return null;
+            var xr = (Xrecord)t.GetObject(dict.GetAt(SummaryDataKey), OpenMode.ForRead);
+            if (xr.Data == null) return null;
+            var vals = xr.Data.AsArray().Select(tv => Convert.ToDouble(tv.Value)).ToArray();
+            if (vals.Length < 10 || (vals[0] != 1 && vals[0] != SummaryDataVersion)) return null;
+            int head = SummaryHeaderLength(vals[0]);
+            int rows = (int)vals[1], cols = (int)vals[2];
+            return vals.Length == head + 2 * cols + 2 * rows ? vals : null;
+        }
+
+        /// <summary>
+        /// Перестраивает итоговые таблицы под текущие шрифт, стиль и цвет
+        /// таблицы. Одной лишь сменой высоты текста не обойтись: ячейки
+        /// заголовков и итогов свёрстаны «впритык» к тексту, а сама таблица
+        /// сдвинута так, чтобы строки/колонки данных совпали с рядами сетки.
+        /// Поэтому таблица (с маскировкой, если она есть) и подпись итогов
+        /// удаляются и строятся заново тем же DrawSummaryTable по данным,
+        /// сохранённым при построении. Таблицы без данных (построены прошлыми
+        /// версиями) только получают новую высоту, цвет и стиль, как раньше.
+        /// Возвращает число перестроенных таблиц.
+        /// </summary>
+        private int RebuildSummaryTables()
+        {
+            using var trans = _db.TransactionManager.StartTransaction();
+            var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+            _ms = (BlockTableRecord)trans.GetObject(
+                bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var found  = new List<(ObjectId Erase, double[] Data)>();
+            var labels = new List<ObjectId>();
+            foreach (ObjectId id in _ms)
+            {
+                var ent = trans.GetObject(id, OpenMode.ForRead) as AcadEntity;
+                if (ent == null || ent.Layer != _o.TableLayerName) continue;
+
+                if (ent is Autodesk.AutoCAD.DatabaseServices.Table tbl)
+                {
+                    var d = LoadSummaryData(trans, tbl);
+                    if (d != null) found.Add((id, d));
+                }
+                else if (ent is BlockReference br)
+                {
+                    // Таблица с маскировкой — в анонимном блоке (см. PlaceTable)
+                    var btr = (BlockTableRecord)trans.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                    foreach (ObjectId sub in btr)
+                        if (trans.GetObject(sub, OpenMode.ForRead) is
+                                Autodesk.AutoCAD.DatabaseServices.Table inner)
+                        {
+                            var d = LoadSummaryData(trans, inner);
+                            if (d != null) found.Add((id, d));
+                        }
+                }
+                // «Площадь:», «Площадь выемки:», «Площадь насыпи:»
+                else if (ent is MText mt && mt.Text.StartsWith("Площадь"))
+                    labels.Add(id);
+            }
+            if (found.Count == 0) { trans.Commit(); return 0; }
+
+            foreach (var id in labels) trans.GetObject(id, OpenMode.ForWrite).Erase();
+
+            var tst = (TextStyleTable)trans.GetObject(_db.TextStyleTableId, OpenMode.ForRead);
+            _tblTsId = tst.Has(_o.TableTextStyleName) ? tst[_o.TableTextStyleName] : _db.Textstyle;
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            double baseX = _o.BaseX, baseY = _o.BaseY;
+
+            foreach (var (eraseId, d) in found)
+            {
+                trans.GetObject(eraseId, OpenMode.ForWrite).Erase();
+
+                int rows = (int)d[1], cols = (int)d[2];
+                bool v2 = d[0] == 2;
+                int k = SummaryHeaderLength(d[0]);
+                double[] Take(int n) { var a = new double[n]; Array.Copy(d, k, a, 0, n); k += n; return a; }
+                var colCut  = Take(cols);
+                var colFill = Take(cols);
+                var rowCut  = Take(rows);
+                var rowFill = Take(rows);
+
+                // Базовая точка — та, от которой таблица строилась (при
+                // «авто» она вычисляется только в расчёте объёмов).
+                _o.BaseX = d[8]; _o.BaseY = d[9];
+                DrawSummaryTable(trans, rows, cols, cA, sA,
+                    colCut, colFill, rowCut, rowFill, d[5], d[6],
+                    (int)d[3], (int)d[4], d[7],
+                    v2 ? d[10] : 0, v2 ? d[11] : 0,
+                    v2 && d[12] != 0, v2 && d[13] != 0);
+            }
+            _o.BaseX = baseX; _o.BaseY = baseY;
+
+            trans.Commit();
+            return found.Count;
         }
 
 // Вспомогательный метод заполнения ячейки таблицы
@@ -3436,9 +4509,9 @@ namespace KartogrammaPlugin
         /// (midpoint-интегрирование с шагом субсетки объёмов).</summary>
         private void CalcZoneVolume((double x0, double y0, double x1, double y1) z,
             CivilSurface s1, CivilSurface s2, double cosA, double sinA,
-            out double vol, out double area)
+            out double vol, out double area, out double areaFill, out double areaCut)
         {
-            vol = 0; area = 0;
+            vol = 0; area = 0; areaFill = 0; areaCut = 0;
             double w = z.x1 - z.x0, ht = z.y1 - z.y0;
             if (w <= 0 || ht <= 0) return;
 
@@ -3456,8 +4529,10 @@ namespace KartogrammaPlugin
                 double? e1 = GetElevS(s1, wx, wy);
                 double? e2 = GetElevS(s2, wx, wy);
                 if (!e1.HasValue || !e2.HasValue || !IsInBounds(wx, wy)) continue;
-                vol  += (e2.Value - e1.Value) * dA;
+                double hw = e2.Value - e1.Value;
+                vol  += hw * dA;
                 area += dA;
+                if (hw > 0) areaFill += dA; else if (hw < 0) areaCut += dA;
             }
         }
 
@@ -3489,7 +4564,8 @@ namespace KartogrammaPlugin
             trans.AddNewlyCreatedDBObject(ltr, true);
         }
 
-        private static int EraseByLayer(Transaction t, BlockTableRecord ms, string layerName)
+        private static int EraseByLayer(Transaction t, BlockTableRecord ms, string layerName,
+            Func<AcadEntity, bool>? where = null)
         {
             var ids = new List<ObjectId>();
             foreach (ObjectId id in ms)
@@ -3497,7 +4573,8 @@ namespace KartogrammaPlugin
                 try
                 {
                     if (t.GetObject(id, OpenMode.ForRead) is AcadEntity ent &&
-                        string.Equals(ent.Layer, layerName, StringComparison.OrdinalIgnoreCase))
+                        string.Equals(ent.Layer, layerName, StringComparison.OrdinalIgnoreCase) &&
+                        (where == null || where(ent)))
                         ids.Add(id);
                 }
                 catch { }
@@ -3518,7 +4595,15 @@ namespace KartogrammaPlugin
 
         private static int Clamp(int v, int lo, int hi) => v < lo ? lo : v > hi ? hi : v;
 
-        private void AddTextToLayer(Transaction t, string layer, Point3d pos, string text,
+        // Угол текста — в МИРОВЫХ осях, независимо от текущей ПСК (у MText
+        // свойство Rotation считается от оси X текущей ПСК).
+        private static Vector3d TextDir(double angle) =>
+            new Vector3d(Math.Cos(angle), Math.Sin(angle), 0);
+
+        private static double TextAngle(MText mt) =>
+            Math.Atan2(mt.Direction.Y, mt.Direction.X);
+
+        private MText AddTextToLayer(Transaction t, string layer, Point3d pos, string text,
             double h, double angle, int aci, ObjectId styleId = default, bool hideMask = false)
         {
             var mt = new MText
@@ -3526,7 +4611,10 @@ namespace KartogrammaPlugin
                 Location        = pos,
                 Contents        = text,
                 TextHeight      = h,
-                Rotation        = angle,
+                // Направление — мировым вектором: MText.Rotation
+                // отсчитывается от оси X ТЕКУЩЕЙ ПСК, и при повёрнутой
+                // ПСК текст уходил бы с угла сетки.
+                Direction       = TextDir(angle),
                 Layer           = layer,
                 Color           = Color.FromColorIndex(ColorMethod.ByAci, (short)aci),
                 TextStyleId     = styleId.IsNull ? _tsId : styleId,
@@ -3540,9 +4628,25 @@ namespace KartogrammaPlugin
             }
             _ms.AppendEntity(mt);
             t.AddNewlyCreatedDBObject(mt, true);
+            return mt;
         }
 
-        private void AddRightAlignedText(Transaction t, string layer, Point3d rightEdge, string text,
+        // Подпись итогов у таблицы: каждая строка — отдельный MText.
+        // bottomLocalY — низ ПОСЛЕДНЕЙ строки (локальные координаты сетки),
+        // строки выше неё идут через lineGap.
+        private void AddSummaryLines(Transaction t, double localX, double bottomLocalY,
+            List<string> lines, double h, double angle, int aci, double lineGap,
+            double cA, double sA)
+        {
+            for (int i = 0; i < lines.Count; i++)
+            {
+                double ly = bottomLocalY + (lines.Count - 1 - i) * lineGap;
+                AddTextToLayer(t, _o.TableLayerName, LW(localX, ly, cA, sA), lines[i],
+                    h, angle, aci, _tblTsId, hideMask: _o.HideMaskTable);
+            }
+        }
+
+        private MText AddRightAlignedText(Transaction t, string layer, Point3d rightEdge, string text,
             double h, double angle, int aci, bool hideMask = false)
         {
             var mt = new MText
@@ -3550,7 +4654,10 @@ namespace KartogrammaPlugin
                 Location        = rightEdge,
                 Contents        = text,
                 TextHeight      = h,
-                Rotation        = angle,
+                // Направление — мировым вектором: MText.Rotation
+                // отсчитывается от оси X ТЕКУЩЕЙ ПСК, и при повёрнутой
+                // ПСК текст уходил бы с угла сетки.
+                Direction       = TextDir(angle),
                 Layer           = layer,
                 Color           = Color.FromColorIndex(ColorMethod.ByAci, (short)aci),
                 TextStyleId     = _tsId,
@@ -3564,9 +4671,466 @@ namespace KartogrammaPlugin
             }
             _ms.AppendEntity(mt);
             t.AddNewlyCreatedDBObject(mt, true);
+            return mt;
         }
 
-        private void AddCenteredText(Transaction t, string layer, Point3d center, string text,
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Подписи объёмов без наездов на тройки отметок.
+        //  Каждая нарисованная подпись (тройки узлов и пересечений с границей,
+        //  уже поставленные объёмы) запоминает свой прямоугольник в локальных
+        //  координатах сетки — по ФАКТИЧЕСКИМ габаритам MText (ActualWidth /
+        //  ActualHeight), поэтому работает при любом шрифте и высоте текста.
+        //  Объём ставится в ближайшую к своему центру (центр ячейки или центр
+        //  своей части — насыпи/выемки) точку, где он ни с чем не пересекается.
+        // ═══════════════════════════════════════════════════════════════════════
+        private readonly List<(double X0, double Y0, double X1, double Y1)> _labelBoxes = new();
+
+        private (double X0, double Y0, double X1, double Y1) LocalBox(MText mt)
+        {
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            double dx = mt.Location.X - _o.BaseX, dy = mt.Location.Y - _o.BaseY;
+            double lx =  dx * cA + dy * sA;
+            double ly = -dx * sA + dy * cA;
+            double w = mt.ActualWidth, h = mt.ActualHeight;
+            if (!(w > 0)) w = mt.Contents.Length * mt.TextHeight * 0.7;
+            if (!(h > 0)) h = mt.TextHeight;
+            return mt.Attachment switch
+            {
+                AttachmentPoint.BottomRight  => (lx - w, ly, lx, ly + h),
+                AttachmentPoint.MiddleCenter => (lx - w / 2, ly - h / 2, lx + w / 2, ly + h / 2),
+                _                            => (lx, ly, lx + w, ly + h),   // BottomLeft
+            };
+        }
+
+        private MText RecordLabelBox(MText mt)
+        {
+            _labelBoxes.Add(LocalBox(mt));
+            return mt;
+        }
+
+        /// <summary>
+        /// Сдвинуть подпись объёма в ближайшее к (idealLx, idealLy) место внутри
+        /// прямоугольника области (ячейка или зона перепада), где она не
+        /// перекрывает уже стоящие подписи. inPart — точка годится под центр
+        /// подписи (внутри своей части ячейки, в пределах границ). Если
+        /// свободного места нет — место с наименьшим перекрытием.
+        /// </summary>
+        private void PlaceVolumeLabel(MText mt, double bx0, double by0, double bw, double bh,
+            double idealLx, double idealLy, Func<double, double, bool> inPart, VolLabelKind kind)
+        {
+            var box  = LocalBox(mt);
+            double w = box.X1 - box.X0, h = box.Y1 - box.Y0;
+            var (bestX, bestY) = FindLabelSpot(w, h, h * 0.15,
+                bx0, by0, bw, bh, idealLx, idealLy, inPart);
+
+            double cAng = Math.Cos(_o.RotationRadians), sAng = Math.Sin(_o.RotationRadians);
+            mt.Location = LW(bestX, bestY, cAng, sAng);
+
+            // Всё, что нужно «Перерисовать», чтобы подобрать место заново под
+            // новый шрифт (RelayoutVolumeLabels): область, центр, часть и
+            // место, куда поставили, — по нему видно, двигал ли её пользователь.
+            mt.XData = new ResultBuffer(
+                new TypedValue((int)DxfCode.ExtendedDataRegAppName, VolPosAppName),
+                new TypedValue((int)DxfCode.ExtendedDataReal, _o.BaseX),
+                new TypedValue((int)DxfCode.ExtendedDataReal, _o.BaseY),
+                new TypedValue((int)DxfCode.ExtendedDataReal, _o.RotationDegrees),
+                new TypedValue((int)DxfCode.ExtendedDataReal, bx0),
+                new TypedValue((int)DxfCode.ExtendedDataReal, by0),
+                new TypedValue((int)DxfCode.ExtendedDataReal, bw),
+                new TypedValue((int)DxfCode.ExtendedDataReal, bh),
+                new TypedValue((int)DxfCode.ExtendedDataReal, idealLx),
+                new TypedValue((int)DxfCode.ExtendedDataReal, idealLy),
+                new TypedValue((int)DxfCode.ExtendedDataInteger16, (short)kind),
+                new TypedValue((int)DxfCode.ExtendedDataReal, bestX),
+                new TypedValue((int)DxfCode.ExtendedDataReal, bestY));
+        }
+
+        /// <summary>
+        /// Ближайшее к (idealLx, idealLy) место под прямоугольник w×h (с полем
+        /// pad) в области, где он не перекрывает уже стоящие подписи. Занятое
+        /// место запоминается в _labelBoxes. Координаты — локальные, сетки.
+        /// </summary>
+        private (double X, double Y) FindLabelSpot(double w, double h, double pad,
+            double bx0, double by0, double bw, double bh,
+            double idealLx, double idealLy, Func<double, double, bool> inPart)
+        {
+            double hw = w / 2 + pad, hh = h / 2 + pad;
+
+            // Только подписи рядом с областью — остальные заведомо не мешают.
+            var near = _labelBoxes.Where(b =>
+                b.X1 > bx0 - w && b.X0 < bx0 + bw + w &&
+                b.Y1 > by0 - h && b.Y0 < by0 + bh + h).ToList();
+
+            double Overlap(double cx, double cy)
+            {
+                double s = 0;
+                foreach (var b in near)
+                {
+                    double ox = Math.Min(cx + hw, b.X1) - Math.Max(cx - hw, b.X0);
+                    double oy = Math.Min(cy + hh, b.Y1) - Math.Max(cy - hh, b.Y0);
+                    if (ox > 0 && oy > 0) s += ox * oy;
+                }
+                return s;
+            }
+
+            double bestX = idealLx, bestY = idealLy;
+            if (Overlap(idealLx, idealLy) > 0)
+            {
+                // Кандидаты — сетка по области; подпись целиком внутри области,
+                // если влезает, иначе её центр в середине по этой оси.
+                double step = Math.Max(Math.Min(bw, bh) / 60.0, h * 0.1);
+                double xLo = bx0 + hw, xHi = bx0 + bw - hw;
+                double yLo = by0 + hh, yHi = by0 + bh - hh;
+                if (xLo > xHi) xLo = xHi = bx0 + bw / 2;
+                if (yLo > yHi) yLo = yHi = by0 + bh / 2;
+
+                var cand = new List<(double X, double Y, double D2)>();
+                for (double y = yLo; y <= yHi + 1e-9; y += step)
+                for (double x = xLo; x <= xHi + 1e-9; x += step)
+                {
+                    double dx = x - idealLx, dy = y - idealLy;
+                    cand.Add((x, y, dx * dx + dy * dy));
+                }
+                cand.Sort((a, b) => a.D2.CompareTo(b.D2));
+
+                double bestScore = double.MaxValue;
+                bool found = false;
+                foreach (var (x, y, d2) in cand)
+                {
+                    double ov = Overlap(x, y);
+                    if (ov <= 0)
+                    {
+                        // Ближайшее свободное место — если оно в своей части
+                        if (!inPart(x, y)) continue;
+                        bestX = x; bestY = y; found = true;
+                        break;
+                    }
+                    // Запасной вариант: наименьшее перекрытие, затем близость
+                    double score = ov * 1e6 + d2;
+                    if (score < bestScore && inPart(x, y))
+                    { bestScore = score; bestX = x; bestY = y; }
+                }
+                if (!found && bestScore == double.MaxValue) { bestX = idealLx; bestY = idealLy; }
+            }
+
+            _labelBoxes.Add((bestX - w / 2, bestY - h / 2, bestX + w / 2, bestY + h / 2));
+            return (bestX, bestY);
+        }
+
+        /// <summary>
+        /// «Площадь и объём»: круг, разделённый горизонтальной полилинией
+        /// пополам; в середине верхней половины — объём, нижней — площадь.
+        /// Радиус подбирается по фактическим габаритам цифр (шрифт, высота,
+        /// число знаков), чтобы обе подписи целиком вписывались в свои
+        /// половины. Всё — на слое объёмов. Место под круг ищется так же,
+        /// как под обычную подпись объёма, — без наездов на тройки отметок.
+        /// </summary>
+        private void PlaceVolumeAreaLabel(Transaction t, string volText, string areaText,
+            double vh, double angle, int aci,
+            double bx0, double by0, double bw, double bh,
+            double idealLx, double idealLy, Func<double, double, bool> inPart)
+        {
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            var ideal = LW(idealLx, idealLy, cA, sA);
+            var mtV = AddCenteredText(t, _o.VolumeLayerName, ideal, volText, vh, angle, aci,
+                hideMask: _o.HideMaskVolume);
+            var mtS = AddCenteredText(t, _o.VolumeLayerName, ideal, areaText, vh, angle, aci,
+                hideMask: _o.HideMaskVolume);
+            var bV = LocalBox(mtV);
+            var bS = LocalBox(mtS);
+
+            // Полуширина и высота более крупной из двух подписей
+            double a  = Math.Max(bV.X1 - bV.X0, bS.X1 - bS.X0) / 2;
+            double th = Math.Max(bV.Y1 - bV.Y0, bS.Y1 - bS.Y0);
+            // Зазор цифр от черты; дальние углы цифр + запас — на окружности
+            double gap = th * 0.3;
+            double off = gap + th / 2;                    // центр цифр от черты
+            double r   = Math.Sqrt(a * a + (gap + th) * (gap + th)) + th * 0.25;
+
+            var (lx, ly) = FindLabelSpot(2 * r, 2 * r, th * 0.15,
+                bx0, by0, bw, bh, idealLx, idealLy, inPart);
+
+            mtV.Location = LW(lx, ly + off, cA, sA);
+            mtS.Location = LW(lx, ly - off, cA, sA);
+
+            var center = LW(lx, ly, cA, sA);
+            var circle = new Circle
+            {
+                Center = center,
+                Radius = r,
+                Normal = Vector3d.ZAxis,
+                Layer  = _o.VolumeLayerName,
+                Color  = Color.FromColorIndex(ColorMethod.ByAci, (short)aci),
+            };
+            _ms.AppendEntity(circle);
+            t.AddNewlyCreatedDBObject(circle, true);
+
+            // Черта — по диаметру, вдоль оси сетки
+            var p0 = LW(lx - r, ly, cA, sA);
+            var p1 = LW(lx + r, ly, cA, sA);
+            var pl = new Polyline();
+            pl.SetDatabaseDefaults();
+            pl.AddVertexAt(0, new Point2d(p0.X, p0.Y), 0, 0, 0);
+            pl.AddVertexAt(1, new Point2d(p1.X, p1.Y), 0, 0, 0);
+            pl.Elevation = center.Z;
+            pl.Layer = _o.VolumeLayerName;
+            pl.Color = Color.FromColorIndex(ColorMethod.ByAci, (short)aci);
+            _ms.AppendEntity(pl);
+            t.AddNewlyCreatedDBObject(pl, true);
+
+            // Связываем в группу: объём — главный, у остальных ссылка на него.
+            // По любой части выноска переносит круг целиком.
+            mtV.XData = new ResultBuffer(
+                new TypedValue((int)DxfCode.ExtendedDataRegAppName, VolAreaAppName),
+                new TypedValue((int)DxfCode.ExtendedDataInteger16, (short)0),
+                new TypedValue((int)DxfCode.ExtendedDataHandle, mtS.Handle.ToString()),
+                new TypedValue((int)DxfCode.ExtendedDataHandle, circle.Handle.ToString()),
+                new TypedValue((int)DxfCode.ExtendedDataHandle, pl.Handle.ToString()));
+            foreach (var member in new AcadEntity[] { mtS, circle, pl })
+                member.XData = new ResultBuffer(
+                    new TypedValue((int)DxfCode.ExtendedDataRegAppName, VolAreaAppName),
+                    new TypedValue((int)DxfCode.ExtendedDataInteger16, (short)1),
+                    new TypedValue((int)DxfCode.ExtendedDataHandle, mtV.Handle.ToString()));
+        }
+
+        // XData группы «Площадь и объём». Главный (MText объёма):
+        // [0, площадь, круг, черта]; остальные части: [1, объём].
+        private const string VolAreaAppName = "OPENKARTOGRAMMA_VOLAREA";
+
+        private ObjectId IdFromHandle(string hex)
+        {
+            try
+            {
+                var id = _db.GetObjectId(false, new Handle(Convert.ToInt64(hex, 16)), 0);
+                return id.IsNull || id.IsErased ? ObjectId.Null : id;
+            }
+            catch { return ObjectId.Null; }
+        }
+
+        /// <summary>Главный объект (MText объёма) группы «Площадь и объём»,
+        /// в которую входит obj; Null — obj не из такой группы.</summary>
+        private ObjectId VolAreaMaster(Autodesk.AutoCAD.DatabaseServices.DBObject obj)
+        {
+            var rb = obj.GetXDataForApplication(VolAreaAppName);
+            if (rb == null) return ObjectId.Null;
+            short role = -1;
+            foreach (TypedValue tv in rb)
+            {
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataInteger16) role = (short)tv.Value;
+                else if (tv.TypeCode == (int)DxfCode.ExtendedDataHandle && role == 1)
+                    return IdFromHandle((string)tv.Value);
+            }
+            return role == 0 ? obj.ObjectId : ObjectId.Null;
+        }
+
+        /// <summary>Части группы по главному MText объёма (открыты на чтение).</summary>
+        private bool TryGetVolAreaGroup(Transaction t, MText master,
+            out MText area, out Circle circle, out Polyline divider)
+        {
+            area = null!; circle = null!; divider = null!;
+            var rb = master.GetXDataForApplication(VolAreaAppName);
+            if (rb == null) return false;
+            var ids = new List<ObjectId>();
+            foreach (TypedValue tv in rb)
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataHandle)
+                    ids.Add(IdFromHandle((string)tv.Value));
+            if (ids.Count != 3 || ids.Any(id => id.IsNull)) return false;
+            if (t.GetObject(ids[0], OpenMode.ForRead) is not MText a ||
+                t.GetObject(ids[1], OpenMode.ForRead) is not Circle c ||
+                t.GetObject(ids[2], OpenMode.ForRead) is not Polyline d) return false;
+            area = a; circle = c; divider = d;
+            return true;
+        }
+
+        /// <summary>
+        /// Выноска круга «Площадь и объём»: от исходного места к ближнему
+        /// концу черты круга — как у одиночного объёма к концу черты под
+        /// цифрой. Если круг вернули на исходное место — выноска не нужна.
+        /// </summary>
+        private ObjectId DrawVolumeAreaLeader(Transaction t, BlockTableRecord ms,
+            Circle circle, Polyline divider, Point3d anchor)
+        {
+            var c = circle.Center;
+            if (new Point2d(anchor.X, anchor.Y).GetDistanceTo(new Point2d(c.X, c.Y)) <= circle.Radius)
+                return ObjectId.Null;
+            var e0 = divider.GetPoint2dAt(0);
+            var e1 = divider.GetPoint2dAt(1);
+            var a2 = new Point2d(anchor.X, anchor.Y);
+            var end = a2.GetDistanceTo(e0) <= a2.GetDistanceTo(e1) ? e0 : e1;
+
+            var pl = new Polyline();
+            pl.SetDatabaseDefaults();
+            pl.AddVertexAt(0, a2, 0, 0, 0);
+            pl.AddVertexAt(1, end, 0, 0, 0);
+            pl.Elevation = c.Z;
+            pl.Layer = _o.VolumeLayerName;
+            pl.Color = Color.FromColorIndex(ColorMethod.ByAci, (short)_o.ColorVolume);
+            ms.AppendEntity(pl);
+            t.AddNewlyCreatedDBObject(pl, true);
+            return pl.ObjectId;
+        }
+
+        /// <summary>Площадь для подписи в круге — с точностью объёмов, без знака.</summary>
+        private string Area(double a) => Num(Math.Abs(a), _o.VolumePrecision);
+
+        internal enum VolLabelKind : short { Cell = 0, Fill = 1, Cut = 2 }
+
+        // XData подписи объёма с данными для повторной раскладки. Отдельное
+        // приложение — у перенесённых подписей своя XData (XAppName).
+        private const string VolPosAppName = "OPENKARTOGRAMMA_VOLPOS";
+
+        private void EnsureVolPosRegApp(Transaction t)
+        {
+            var rat = (RegAppTable)t.GetObject(_db.RegAppTableId, OpenMode.ForRead);
+            foreach (var name in new[] { VolPosAppName, VolAreaAppName })
+            {
+                if (rat.Has(name)) continue;
+                if (!rat.IsWriteEnabled) rat.UpgradeOpen();
+                var rec = new RegAppTableRecord { Name = name };
+                rat.Add(rec);
+                t.AddNewlyCreatedDBObject(rec, true);
+            }
+        }
+
+        private Func<double, double, bool> PartPredicate(VolLabelKind kind,
+            CivilSurface? s1, CivilSurface? s2)
+        {
+            if (s1 == null || s2 == null) return (lx, ly) => true;
+            return kind switch
+            {
+                VolLabelKind.Fill => (lx, ly) => WorkAt(s1, s2, lx, ly) > 0,
+                VolLabelKind.Cut  => (lx, ly) => WorkAt(s1, s2, lx, ly) < 0,
+                _                 => (lx, ly) => LabelVisible(s1, s2, lx, ly),
+            };
+        }
+
+        /// <summary>
+        /// «Перерисовать»: после смены шрифта/высоты подписи объёмов заново
+        /// ставятся без наездов на тройки отметок — так же, как при расчёте.
+        /// Двигаются только подписи, которые стоят там, куда их поставила
+        /// программа; перенесённые пользователем (вручную или выноской)
+        /// остаются на месте и сами считаются препятствием.
+        /// </summary>
+        private void RelayoutVolumeLabels()
+        {
+            using var trans = _db.TransactionManager.StartTransaction();
+            var rat = (RegAppTable)trans.GetObject(_db.RegAppTableId, OpenMode.ForRead);
+            if (!rat.Has(VolPosAppName)) { trans.Commit(); return; }
+
+            var bt = (BlockTable)trans.GetObject(_db.BlockTableId, OpenMode.ForRead);
+            _ms = (BlockTableRecord)trans.GetObject(
+                bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var fixedTexts = new List<MText>();
+            var movable    = new List<(MText Mt, double[] D, VolLabelKind Kind)>();
+            foreach (ObjectId id in _ms)
+            {
+                if (trans.GetObject(id, OpenMode.ForRead) is not MText mt) continue;
+                if (mt.Layer == _o.WorkLayerName || mt.Layer == _o.DesignLayerName ||
+                    mt.Layer == _o.ExistLayerName)
+                {
+                    fixedTexts.Add(mt);
+                    continue;
+                }
+                if (mt.Layer != _o.VolumeLayerName) continue;
+
+                var rb = mt.GetXDataForApplication(VolPosAppName);
+                double[]? d = null; short kind = 0;
+                if (rb != null && mt.GetXDataForApplication(XAppName) == null)
+                {
+                    var reals = new List<double>();
+                    foreach (TypedValue tv in rb)
+                    {
+                        if (tv.TypeCode == (int)DxfCode.ExtendedDataReal) reals.Add((double)tv.Value);
+                        else if (tv.TypeCode == (int)DxfCode.ExtendedDataInteger16) kind = (short)tv.Value;
+                    }
+                    if (reals.Count == 11) d = reals.ToArray();
+                }
+                if (d == null) { fixedTexts.Add(mt); continue; }
+
+                // Стоит ли там, куда её поставила программа (в её системе сетки)
+                double cA0 = Math.Cos(d[2] * Math.PI / 180), sA0 = Math.Sin(d[2] * Math.PI / 180);
+                double px = d[0] + d[9] * cA0 - d[10] * sA0;
+                double py = d[1] + d[9] * sA0 + d[10] * cA0;
+                double tol = Math.Max(mt.TextHeight * 0.01, 1e-6);
+                if (Math.Abs(mt.Location.X - px) > tol || Math.Abs(mt.Location.Y - py) > tol)
+                    fixedTexts.Add(mt);
+                else
+                    movable.Add((mt, d, (VolLabelKind)kind));
+            }
+            if (movable.Count == 0) { trans.Commit(); return; }
+
+            // Поверхности и границы — чтобы подпись осталась в своей части
+            // ячейки. Без них — только без наездов в пределах ячейки.
+            CivilSurface? s1 = null, s2 = null;
+            try
+            {
+                if (FindSurfaces(trans, CivilApplication.ActiveDocument, out s1, out s2))
+                {
+                    PrepareElevationCache(s1!, s2!);
+                    LoadManualBoundaries(trans);
+                }
+                else s1 = s2 = null;
+            }
+            catch { s1 = s2 = null; }
+
+            double baseX = _o.BaseX, baseY = _o.BaseY, rotDeg = _o.RotationDegrees;
+            try
+            {
+                // Картограмм в чертеже может быть несколько — у каждой своя
+                // система сетки; раскладываем по группам.
+                foreach (var grp in movable.GroupBy(m => (m.D[0], m.D[1], m.D[2])))
+                {
+                    _o.BaseX = grp.Key.Item1; _o.BaseY = grp.Key.Item2; _o.RotationDegrees = grp.Key.Item3;
+                    double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+
+                    _labelBoxes.Clear();
+                    foreach (var f in fixedTexts) _labelBoxes.Add(LocalBox(f));
+
+                    foreach (var (mt, d, kind) in grp)
+                    {
+                        mt.UpgradeOpen();
+                        mt.Location = LW(d[7], d[8], cA, sA);
+                        PlaceVolumeLabel(mt, d[3], d[4], d[5], d[6], d[7], d[8],
+                            PartPredicate(kind, s1, s2), kind);
+                    }
+                }
+            }
+            finally
+            {
+                _o.BaseX = baseX; _o.BaseY = baseY; _o.RotationDegrees = rotDeg;
+            }
+            trans.Commit();
+        }
+
+        // Годится ли точка под центр подписи объёма обычной ячейки — тот же
+        // критерий «видимой части», что и в FindInsideAnchor.
+        private bool LabelVisible(CivilSurface s1, CivilSurface s2, double lx, double ly)
+        {
+            bool manual = _boundaryPts != null || _innerPtsList != null;
+            if (!manual && !_o.ClipCells) return true;
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            double wx = _o.BaseX + lx * cA - ly * sA;
+            double wy = _o.BaseY + lx * sA + ly * cA;
+            return manual
+                ? IsInClipRegion(wx, wy)
+                : GetElevS(s1, wx, wy).HasValue && GetElevS(s2, wx, wy).HasValue;
+        }
+
+        // Рабочая отметка в локальной точке; NaN — нет данных или вне границ.
+        private double WorkAt(CivilSurface s1, CivilSurface s2, double lx, double ly)
+        {
+            double cA = Math.Cos(_o.RotationRadians), sA = Math.Sin(_o.RotationRadians);
+            double wx = _o.BaseX + lx * cA - ly * sA;
+            double wy = _o.BaseY + lx * sA + ly * cA;
+            if (!IsInClipRegion(wx, wy) || InAnomalyZoneW(wx, wy)) return double.NaN;
+            double? e1 = GetElevS(s1, wx, wy);
+            double? e2 = GetElevS(s2, wx, wy);
+            if (!e1.HasValue || !e2.HasValue) return double.NaN;
+            return e2.Value - e1.Value;
+        }
+
+        private MText AddCenteredText(Transaction t, string layer, Point3d center, string text,
             double h, double angle, int aci, bool hideMask = false)
         {
             var mt = new MText
@@ -3574,7 +5138,10 @@ namespace KartogrammaPlugin
                 Location        = center,
                 Contents        = text,
                 TextHeight      = h,
-                Rotation        = angle,
+                // Направление — мировым вектором: MText.Rotation
+                // отсчитывается от оси X ТЕКУЩЕЙ ПСК, и при повёрнутой
+                // ПСК текст уходил бы с угла сетки.
+                Direction       = TextDir(angle),
                 Layer           = layer,
                 Color           = Color.FromColorIndex(ColorMethod.ByAci, (short)aci),
                 TextStyleId     = _tsId,
@@ -3588,13 +5155,23 @@ namespace KartogrammaPlugin
             }
             _ms.AppendEntity(mt);
             t.AddNewlyCreatedDBObject(mt, true);
+            return mt;
         }
 
-        private static string Signed(double v, int d = 2)
+        private string Signed(double v, int d = 2)
         {
-            string s = v.ToString("F" + d);
+            string s = Num(v, d);
             return v > 0 ? "+" + s : s;
         }
+
+        /// <summary>
+        /// Число для чертежа: d знаков после запятой и разделитель из настроек
+        /// («.», «,» или без разделителя) — не зависит от региональных
+        /// настроек Windows.
+        /// </summary>
+        private string Num(double v, int d = 2) =>
+            v.ToString("F" + d, System.Globalization.CultureInfo.InvariantCulture)
+             .Replace(".", _o.DecimalSeparator);
 
         // ═══════════════════════════════════════════════════════════════════════
         //  Обрезка ячеек по наружной границе (полилинии)

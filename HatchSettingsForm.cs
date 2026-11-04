@@ -137,7 +137,7 @@ namespace KartogrammaPlugin
             var lblZColor  = Lbl("Цвет:",      body, zx, zrowTop);
             var lblZType   = Lbl("Тип линии:", body, zx, zrowTop);
             var lblZWeight = Lbl("Вес:",       body, zx, zrowTop);
-            var lblZPrv    = Lbl("Образец:",   body, zx, zrowTop);
+            var lblZPrv    = Lbl("Предпросмотр:", body, zx, zrowTop);
 
             int zColorW = S(46);
             int zFixed  = S(14) + lblZColor.Width + S(6) + zColorW + S(16)
@@ -148,7 +148,7 @@ namespace KartogrammaPlugin
 
             int zTypeW   = Math.Max(S(110), zFree * 42 / 100);
             int zWeightW = Math.Max(S(80),  zFree * 24 / 100);
-            // Образец — второстепенный: если места на него не осталось, прячем
+            // Предпросмотр — второстепенный: если места на него не осталось, прячем
             // его вместе с подписью, но поля выбора не режем.
             int zPrvW    = zFree - zTypeW - zWeightW;
             bool showPrv = zPrvW >= S(60);

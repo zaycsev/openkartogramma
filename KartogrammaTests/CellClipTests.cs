@@ -50,6 +50,24 @@ namespace KartogrammaTests
             Assert.Empty(loops);
         }
 
+        // ── Седло bl–tr (case 5, связная полоса) ──────────────────────
+
+        [Fact]
+        public void Saddle_ConnectedBand_BuildsContour()
+        {
+            // Клин у наклонной границы, пересечённый нулевой линией (файл
+            // «Холмик»): в одном квадратике выборки заняты bl и tr, центр
+            // тоже внутри. Неверное направление отрезка в этом седле ломало
+            // сшивку — ячейка оставалась без штриховки.
+            Func<double, double, bool> pred = (x, y) =>
+                y < 0.277 + 0.265 * x && 0.291 - 0.248 * x + 0.088 * y > 0;
+
+            var fill = CellClipper.Clip(5, 5, 40, Refine, pred, out var loops);
+
+            Assert.Equal(CellClipper.CellFill.Partial, fill);
+            Assert.NotEmpty(loops);
+        }
+
         // ── Прямой рез ────────────────────────────────────────────────
 
         [Fact]
